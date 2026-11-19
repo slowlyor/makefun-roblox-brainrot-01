@@ -1,14 +1,15 @@
--- init.server.luau -- Brainrot Bazaar server orchestration.
--- Builds the world, runs the conveyor-belt shop, pad income, collecting,
--- base locking, the thief NPC, the tsunami, gacha and rebirths, and
--- keeps every client's HUD in sync. State lives in GameState only.
+-- init.server.luau
+-- Brainrot Bazaar: server bootstrap and the game's conductor.
+-- Builds the world, wires every prompt and remote, runs the belt
+-- spawner, the income tick, the tsunami clock and the plaza
+-- animations. Rules live in GameState; this file only connects them.
 
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local RunService = game:GetService("RunService")
 
 local Shared = ReplicatedStorage:WaitForChild("Shared")
 local BrainrotData = require(Shared:WaitForChild("BrainrotData"))
+
 local GameState = require(script:WaitForChild("GameState"))
 local WorldBuilder = require(script:WaitForChild("WorldBuilder"))
 local BrainrotFactory = require(script:WaitForChild("BrainrotFactory"))
@@ -16,24 +17,37 @@ local MoveService = require(script:WaitForChild("MoveService"))
 local Thief = require(script:WaitForChild("Thief"))
 local GachaService = require(script:WaitForChild("GachaService"))
 
-local rng = Random.new()
+local TSUNAMI_PERIOD = 180
+local TSUNAMI_WARNING = 10
+local BELT_TOP_Y = WorldBuilder.Layout.Belt.TopY
+local BELT_SPAWN_X = -64
+local BELT_END_X = 64
+local BELT_Z = WorldBuilder.Layout.Belt.Z
+local MAX_BELT = 10
+local BELT_WALK_SPEED = 6
 
--- Remotes the clients read: state snapshots and toast messages up,
--- rebirth requests down.
+local rng = Random.new()
+local world = WorldBuilder.Build()
+MoveService.Start()
+
+-- Remotes ------------------------------------------------------------
 local remotes = Instance.new("Folder")
-remotes.Name = "BrainrotRemotes"
+remotes.Name = "BB_Remotes"
 remotes.Parent = ReplicatedStorage
-local stateSync = Instance.new("RemoteEvent")
-stateSync.Name = "StateSync"
-stateSync.Parent = remotes
+
+local stateRemote = Instance.new("RemoteEvent")
+stateRemote.Name = "State"
+stateRemote.Parent = remotes
+
 local toastRemote = Instance.new("RemoteEvent")
 toastRemote.Name = "Toast"
 toastRemote.Parent = remotes
-local rebirthRequest = Instance.new("RemoteEvent")
-rebirthRequest.Name = "RebirthRequest"
-rebirthRequest.Parent = remotes
 
-local refs = WorldBuilder.Build()
+local actionRemote = Instance.new("RemoteEvent")
+actionRemote.Name = "Action"
+actionRemote.Parent = remotes
+
+local nextTsunamiAt = GameState.Now() + TSUNAMI_PERIOD
 
 local function toastPlayer(player, text)
 	toastRemote:FireClient(player, text)
@@ -43,376 +57,476 @@ local function toastAll(text)
 	toastRemote:FireAllClients(text)
 end
 
--- Settle a brainrot model onto a pad of the player's base and start it
--- earning. Used by belt purchases and by the gacha machine alike.
-local function placeBrainrot(state, padIndex, model)
-	if GameState.Players[state.UserId] ~= state then
-		model:Destroy()
-		return
-	end
-	if state.Pads[padIndex] then
-		padIndex = GameState.FreePad(state)
-		if not padIndex then
-			model:Destroy()
-			return
-		end
-	end
-	local padPos = refs.Plots[state.PlotIndex].PadPositions[padIndex]
-	MoveService.PlaceAt(model, padPos.X, padPos.Z, 0.45, math.atan2(
-		refs.Plots[state.PlotIndex].Center.X - padPos.X,
-		refs.Plots[state.PlotIndex].Center.Z - padPos.Z))
-	GameState.PlaceOnPad(state, padIndex, model:GetAttribute("DefIndex"),
-		model:GetAttribute("Mutation"), model)
+local function buildState(player, data)
+	return {
+		Cash = math.floor(data.Cash),
+		IncomePerSecond = GameState.IncomePerSecond(data),
+		Stored = GameState.StoredTotal(data),
+		Multiplier = GameState.Multiplier(data),
+		Rebirths = data.Rebirths,
+		RebirthCost = GameState.RebirthCost(data),
+		GachaCost = GameState.GachaCost(data),
+		GachaRolls = data.GachaRolls,
+		LockedSeconds = GameState.LockSecondsLeft(data),
+		Occupied = GameState.OccupiedCount(data),
+		PadsMax = GameState.PADS_PER_BASE,
+		Collection = GameState.CollectionList(data),
+		CollectionCount = GameState.CollectionCount(data),
+		CollectionTotal = BrainrotData.Count(),
+		TsunamiIn = math.max(0, math.ceil(nextTsunamiAt - GameState.Now())),
+		PlotIndex = data.PlotIndex,
+	}
 end
 
-local deps = {
+local function syncPlayer(player)
+	local data = GameState.Get(player)
+	if not data then
+		return
+	end
+	stateRemote:FireClient(player, buildState(player, data))
+	local stats = player:FindFirstChild("leaderstats")
+	if stats then
+		local cash = stats:FindFirstChild("Cash")
+		if cash then
+			cash.Value = math.floor(data.Cash)
+		end
+		local rebirths = stats:FindFirstChild("Rebirth")
+		if rebirths then
+			rebirths.Value = data.Rebirths
+		end
+	end
+end
+
+local function syncAll()
+	for player in pairs(GameState.Players) do
+		syncPlayer(player)
+	end
+end
+
+-- Context handed to the services so they never require each other.
+local ctx = {
 	GameState = GameState,
-	BrainrotFactory = BrainrotFactory,
+	BrainrotData = BrainrotData,
+	World = world,
+	Factory = BrainrotFactory,
 	MoveService = MoveService,
-	Refs = refs,
 	Rng = rng,
-	ToastAll = toastAll,
 	ToastPlayer = toastPlayer,
-	PlaceBrainrot = placeBrainrot,
+	ToastAll = toastAll,
+	SyncPlayer = syncPlayer,
 }
 
-----------------------------------------------------------------------
--- The conveyor belt shop
-----------------------------------------------------------------------
+-- Bases ---------------------------------------------------------------
+local plotOwner = {} -- [plotIndex] -> Player
 
-local beltModels = {} -- [model] = true, everything currently for sale
-
-local function spawnBeltBrainrot()
-	local defIndex = BrainrotData.RollCharacter(rng, BrainrotData.BeltWeights)
-	local mutation = BrainrotData.RollMutation(rng)
-	local model = BrainrotFactory.Create(defIndex, mutation.Name, Vector3.new(refs.BeltStartX, 0, refs.BeltZ))
-	model:SetAttribute("ForSale", true)
-	model.Parent = refs.World
-	beltModels[model] = true
-
-	if BrainrotData.Get(defIndex).Rarity == "Divine" then
-		toastAll("DIVINE MUNCUL DI TOKO! " .. BrainrotData.Get(defIndex).Name .. " berjalan di sabuk!")
-	end
-
-	local prompt = Instance.new("ProximityPrompt")
-	prompt.ActionText = "Beli " .. BrainrotData.FormatMoney(BrainrotData.PriceFor(defIndex, mutation.Name))
-	prompt.ObjectText = BrainrotData.Get(defIndex).Name
-	prompt.HoldDuration = 0
-	prompt.MaxActivationDistance = 12
-	prompt.Parent = model.PrimaryPart
-	prompt.Triggered:Connect(function(player)
-		buyBeltBrainrot(player, model, prompt)
-	end)
-
-	MoveService.WalkTo(model, refs.BeltEndX, refs.BeltZ, MoveService.BELT_Y, 6, function()
-		if model:GetAttribute("ForSale") then
-			beltModels[model] = nil
-			model:Destroy()
-		end
-	end)
-end
-
-function buyBeltBrainrot(player, model, prompt)
-	if not model:GetAttribute("ForSale") or not model.Parent then
-		return
-	end
-	if model:GetAttribute("Claimed") then
-		return -- another player's purchase is already walking this one home
-	end
-	local state = GameState.Get(player)
-	if not state then
-		return
-	end
-	local defIndex = model:GetAttribute("DefIndex")
-	local mutationName = model:GetAttribute("Mutation")
-	local price = BrainrotData.PriceFor(defIndex, mutationName)
-	local padIndex = GameState.FreePad(state)
-	if not padIndex then
-		toastPlayer(player, "Basis PENUH! Jual ruang dulu (atau rebirth).")
-		return
-	end
-	if state.Cash < price then
-		toastPlayer(player, "Uang tidak cukup! Butuh " .. BrainrotData.FormatMoney(price))
-		return
-	end
-
-	state.Cash -= price
-	model:SetAttribute("Claimed", true)
-	model:SetAttribute("ForSale", false)
-	beltModels[model] = nil
-	prompt:Destroy()
-	toastPlayer(player, "Kamu membeli " .. BrainrotData.Get(defIndex).Name .. "!")
-
-	-- Off the belt, across the plaza path, onto the pad.
-	local plot = refs.Plots[state.PlotIndex]
-	local padPos = plot.PadPositions[padIndex]
-	MoveService.WalkPath(model, {
-		{ X = padPos.X, Z = refs.BeltZ, BaseY = MoveService.BELT_Y, Speed = 8 },
-		{ X = padPos.X, Z = plot.Center.Z + plot.FrontDir * 20, BaseY = MoveService.GROUND_Y, Speed = 8 },
-		{ X = padPos.X, Z = padPos.Z, BaseY = 0.45, Speed = 8 },
-	}, function()
-		placeBrainrot(state, padIndex, model)
-	end)
-end
-
-task.spawn(function()
-	while true do
-		task.wait(2.2)
-		local count = 0
-		for _ in pairs(beltModels) do
-			count += 1
-		end
-		if count < 9 then
-			spawnBeltBrainrot()
-		end
-	end
-end)
-
-----------------------------------------------------------------------
--- Collect pads, lock buttons and the gacha machine
-----------------------------------------------------------------------
-
-for _, plot in ipairs(refs.Plots) do
-	local lastCollect = {}
-	plot.CollectPad.Touched:Connect(function(hit)
-		local character = hit.Parent
-		local player = character and Players:GetPlayerFromCharacter(character)
-		if not player then
-			return
-		end
-		local state = GameState.Get(player)
-		if not state or state.PlotIndex ~= plot.Index then
-			return
-		end
-		local now = os.clock()
-		if lastCollect[player.UserId] and now - lastCollect[player.UserId] < 1 then
-			return
-		end
-		lastCollect[player.UserId] = now
-		local amount = GameState.Collect(state)
-		if amount > 0 then
-			toastPlayer(player, "Kamu memanen " .. BrainrotData.FormatMoney(amount) .. "!")
-		end
-	end)
-
-	local lockPrompt = Instance.new("ProximityPrompt")
-	lockPrompt.ActionText = "Kunci Basis 60 detik"
-	lockPrompt.ObjectText = "Tombol Kunci"
-	lockPrompt.MaxActivationDistance = 10
-	lockPrompt.Parent = plot.LockButton
-	lockPrompt.Triggered:Connect(function(player)
-		local state = GameState.Get(player)
-		if not state or state.PlotIndex ~= plot.Index then
-			return
-		end
-		if GameState.IsLocked(state) then
-			toastPlayer(player, "Basis sudah terkunci (" .. GameState.LockSecondsLeft(state) .. " dtk).")
-			return
-		end
-		state.LockedUntil = os.clock() + GameState.LOCK_SECONDS
-		toastPlayer(player, "Basis TERKUNCI selama 60 detik! Pencuri tidak bisa masuk.")
-	end)
-end
-
-local gachaPrompt = Instance.new("ProximityPrompt")
-gachaPrompt.ActionText = "Putar Gacha"
-gachaPrompt.ObjectText = "Mesin Gacha Brainrot"
-gachaPrompt.MaxActivationDistance = 12
-gachaPrompt.Parent = refs.GachaMachine
-gachaPrompt.Triggered:Connect(function(player)
-	local state = GameState.Get(player)
-	if state then
-		GachaService.Roll(state, deps)
-	end
-end)
-
-----------------------------------------------------------------------
--- Rebirth (the client asks twice before firing this; see Hud)
-----------------------------------------------------------------------
-
-rebirthRequest.OnServerEvent:Connect(function(player)
-	local state = GameState.Get(player)
-	if not state then
-		return
-	end
-	local cost = GameState.RebirthCost(state)
-	if state.Cash < cost then
-		toastPlayer(player, "Rebirth butuh " .. BrainrotData.FormatMoney(cost))
-		return
-	end
-	for _, pad in pairs(state.Pads) do
-		if pad.Model then
-			MoveService.Stop(pad.Model)
-			pad.Model:Destroy()
-		end
-	end
-	GameState.ApplyRebirth(state)
-	toastPlayer(player, string.format("REBIRTH! Penghasilan permanen x%.2f", GameState.Multiplier(state)))
-end)
-
-----------------------------------------------------------------------
--- Players joining and leaving
-----------------------------------------------------------------------
-
-local function freePlotIndex()
-	for i = 1, 8 do
-		if not GameState.PlotOwners[i] then
+local function claimPlot(player)
+	for i = 1, #world.Plots do
+		if plotOwner[i] == nil then
+			plotOwner[i] = player
 			return i
 		end
 	end
 	return nil
 end
 
-Players.PlayerAdded:Connect(function(player)
-	local plotIndex = freePlotIndex()
-	if not plotIndex then
-		toastPlayer(player, "Semua basis penuh! Menonton dulu ya.")
+local function setBarrier(data, on)
+	local plot = world.Plots[data.PlotIndex]
+	if not plot then
 		return
 	end
-	local state = GameState.CreatePlayer(player, plotIndex)
-	player.CharacterAdded:Connect(function(character)
-		task.wait(0.2)
-		local root = character:WaitForChild("HumanoidRootPart", 5)
-		if root then
-			root.CFrame = CFrame.new(Vector3.new(0, 3, 26)) * CFrame.Angles(0, math.rad(180), 0)
+	for _, wall in ipairs(plot.Barrier) do
+		wall.Visible = on
+		wall.CanCollide = on
+	end
+	local button = plot.LockButton
+	if button then
+		button.Color = on and Color3.fromRGB(60, 220, 90) or Color3.fromRGB(255, 90, 90)
+	end
+end
+
+local function doLock(player)
+	local data = GameState.Get(player)
+	if not data then
+		return
+	end
+	if GameState.IsLocked(data) then
+		toastPlayer(player, "Base sudah terkunci (" .. GameState.LockSecondsLeft(data) .. "s).")
+		return
+	end
+	data.LockUntil = GameState.Now() + GameState.LOCK_SECONDS
+	setBarrier(data, true)
+	toastPlayer(player, "Base terkunci 60 detik! Pencuri tidak bisa masuk.")
+	task.delay(GameState.LOCK_SECONDS, function()
+		if GameState.Get(player) == data and not GameState.IsLocked(data) then
+			setBarrier(data, false)
+			toastPlayer(player, "Kunci base habis.")
+			syncPlayer(player)
 		end
 	end)
-	toastPlayer(player, "Selamat datang! Basismu: Basis " .. string.char(64 + plotIndex)
-		.. ". Beli brainrot dari sabuk berjalan!")
+	syncPlayer(player)
+end
+
+local function doCollect(player)
+	local data = GameState.Get(player)
+	if not data then
+		return
+	end
+	local amount = GameState.Collect(data)
+	if amount > 0 then
+		toastPlayer(player, "Panen $" .. amount .. "!")
+	else
+		toastPlayer(player, "Belum ada uang tersimpan.")
+	end
+	syncPlayer(player)
+end
+
+local function doRebirth(player)
+	local data = GameState.Get(player)
+	if not data then
+		return
+	end
+	local cost = GameState.RebirthCost(data)
+	if data.Cash < cost then
+		toastPlayer(player, "Rebirth butuh $" .. cost .. ".")
+		return
+	end
+	setBarrier(data, false)
+	GameState.DoRebirth(data)
+	toastPlayer(player, "REBIRTH! Penghasilan permanen x" .. string.format("%.2f", GameState.Multiplier(data)))
+	syncPlayer(player)
+end
+
+-- Buying from the belt -------------------------------------------------
+local beltModels = {}
+
+local function placeOnPad(player, data, def, mutation, price, income)
+	local padIndex = GameState.FreePad(data)
+	if not padIndex then
+		return false
+	end
+	local plot = world.Plots[data.PlotIndex]
+	local entry = { DefId = def.Id, Mutation = mutation.Name, Price = price, Income = income, Stored = 0 }
+	GameState.PlaceBrainrot(data, padIndex, entry)
+	data.TotalBuys += 1
+	local padPos = plot.Pads[padIndex]
+	local placed = BrainrotFactory.Create(def, mutation.Name)
+	placed.Parent = workspace
+	placed:PivotTo(CFrame.new(padPos.X, padPos.Y + BrainrotFactory.ROOT_LIFT, padPos.Z))
+	local mutText = mutation.Name ~= "Normal" and (" " .. mutation.Name) or ""
+	BrainrotFactory.SetLabel(placed, def.Name .. mutText, "$" .. income .. "/s", BrainrotData.RARITY_COLORS[def.Rarity])
+	data.PadModels[padIndex] = placed
+	if def.Rarity == "Divine" then
+		BrainrotFactory.SparkleBurst(padPos + Vector3.new(0, 1, 0))
+	end
+	return true
+end
+
+local function tryBuy(player, beltModel, spawn)
+	local data = GameState.Get(player)
+	if not data then
+		return
+	end
+	if not beltModel.Parent then
+		return
+	end
+	if GameState.FreePad(data) == nil then
+		toastPlayer(player, "Base penuh! (6/6) Panen, rebirth, atau tunggu pencuri.")
+		return
+	end
+	if data.Cash < spawn.Price then
+		toastPlayer(player, "Uang kurang: butuh $" .. spawn.Price .. ".")
+		return
+	end
+	data.Cash -= spawn.Price
+	local ok = placeOnPad(player, data, spawn.Def, spawn.Mutation, spawn.Price, spawn.Income)
+	if not ok then
+		data.Cash += spawn.Price
+		toastPlayer(player, "Base penuh!")
+		return
+	end
+	-- The belt walker leaves the belt for good.
+	local walker = MoveService.FindByModel(beltModel)
+	if walker then
+		MoveService.Remove(walker, true)
+	end
+	beltModels[beltModel] = nil
+	toastPlayer(player, "Membeli " .. spawn.Def.Name .. " ($" .. spawn.Price .. ")")
+	syncPlayer(player)
+end
+
+local function spawnBeltBrainrot()
+	if MoveService.CountByTag("belt") >= MAX_BELT then
+		return
+	end
+	local rarity = BrainrotData.RollRarity(BrainrotData.BELT_WEIGHTS, rng)
+	local def = BrainrotData.RandomOfRarity(rarity, rng)
+	local mutation = BrainrotData.RollMutation(rng)
+	local price = BrainrotData.PriceFor(def, mutation)
+	local income = BrainrotData.IncomeFor(def, mutation)
+	local model = BrainrotFactory.Create(def, mutation.Name)
+	model.Parent = workspace
+	model:PivotTo(CFrame.new(BELT_SPAWN_X, BELT_TOP_Y + BrainrotFactory.ROOT_LIFT, BELT_Z))
+	local mutText = mutation.Name ~= "Normal" and (" " .. mutation.Name) or ""
+	BrainrotFactory.SetLabel(model, def.Name .. mutText, def.Rarity .. " - $" .. price .. " - $" .. income .. "/s", BrainrotData.RARITY_COLORS[def.Rarity])
+	local prompt = Instance.new("ProximityPrompt")
+	prompt.Name = "BuyPrompt"
+	prompt.ActionText = "Beli $" .. price
+	prompt.ObjectText = def.Name
+	prompt.HoldDuration = 0
+	prompt.MaxActivationDistance = 12
+	prompt.Parent = model.PrimaryPart
+	local spawn = { Def = def, Mutation = mutation, Price = price, Income = income }
+	beltModels[model] = spawn
+	prompt.Triggered:Connect(function(player)
+		tryBuy(player, model, spawn)
+	end)
+	if def.Rarity == "Divine" then
+		BrainrotFactory.SparkleBurst(Vector3.new(BELT_SPAWN_X, BELT_TOP_Y + 1, BELT_Z))
+		toastAll("BRAINROT DIVINE muncul di conveyor: " .. def.Name .. "!")
+	end
+	MoveService.Add(model, {
+		Path = { Vector3.new(BELT_END_X, 0, BELT_Z) },
+		Speed = BELT_WALK_SPEED,
+		PivotY = BELT_TOP_Y + BrainrotFactory.ROOT_LIFT,
+		Tag = "belt",
+		OnArrive = function()
+			beltModels[model] = nil
+			model:Destroy()
+		end,
+		OnCancel = function()
+			beltModels[model] = nil
+		end,
+	})
+end
+
+-- Per-plot prompts ------------------------------------------------------
+local function wirePlotPrompts(plot)
+	local collectPrompt = Instance.new("ProximityPrompt")
+	collectPrompt.Name = "CollectPrompt"
+	collectPrompt.ActionText = "Panen Uang"
+	collectPrompt.ObjectText = "Pad Panen"
+	collectPrompt.HoldDuration = 0
+	collectPrompt.MaxActivationDistance = 10
+	collectPrompt.Parent = plot.CollectPad
+	collectPrompt.Triggered:Connect(function(player)
+		local data = GameState.Get(player)
+		if data and data.PlotIndex == plot.Index then
+			doCollect(player)
+		end
+	end)
+	local lockPrompt = Instance.new("ProximityPrompt")
+	lockPrompt.Name = "LockPrompt"
+	lockPrompt.ActionText = "Kunci Base 60s"
+	lockPrompt.ObjectText = "Tombol Kunci"
+	lockPrompt.HoldDuration = 0
+	lockPrompt.MaxActivationDistance = 10
+	lockPrompt.Parent = plot.LockButton
+	lockPrompt.Triggered:Connect(function(player)
+		local data = GameState.Get(player)
+		if data and data.PlotIndex == plot.Index then
+			doLock(player)
+		end
+	end)
+end
+
+for _, plot in ipairs(world.Plots) do
+	wirePlotPrompts(plot)
+end
+
+-- Gacha prompt -----------------------------------------------------------
+local gachaPrompt = Instance.new("ProximityPrompt")
+gachaPrompt.Name = "GachaPrompt"
+gachaPrompt.ActionText = "Putar Gacha"
+gachaPrompt.ObjectText = "Mesin Gacha"
+gachaPrompt.HoldDuration = 0
+gachaPrompt.MaxActivationDistance = 12
+gachaPrompt.Parent = world.GachaMachine:FindFirstChild("Body")
+gachaPrompt.Triggered:Connect(function(player)
+	GachaService.Roll(ctx, player)
 end)
 
-Players.PlayerRemoving:Connect(function(player)
-	local state = GameState.RemovePlayer(player)
-	if state then
-		for _, pad in pairs(state.Pads) do
-			if pad.Model then
-				pad.Model:Destroy()
+-- Client actions -----------------------------------------------------------
+actionRemote.OnServerEvent:Connect(function(player, action)
+	if action == "collect" then
+		doCollect(player)
+	elseif action == "lock" then
+		doLock(player)
+	elseif action == "rebirth" then
+		doRebirth(player)
+	elseif action == "gacha" then
+		GachaService.Roll(ctx, player)
+	end
+end)
+
+-- Players ------------------------------------------------------------------
+local function onPlayerAdded(player)
+	local plotIndex = claimPlot(player)
+	if not plotIndex then
+		player:Kick("Server penuh: semua base sudah terisi.")
+		return
+	end
+	local data = GameState.CreatePlayer(player, plotIndex)
+	local stats = Instance.new("Folder")
+	stats.Name = "leaderstats"
+	local cash = Instance.new("IntValue")
+	cash.Name = "Cash"
+	cash.Value = data.Cash
+	cash.Parent = stats
+	local rebirths = Instance.new("IntValue")
+	rebirths.Name = "Rebirth"
+	rebirths.Value = 0
+	rebirths.Parent = stats
+	stats.Parent = player
+	local plot = world.Plots[plotIndex]
+	local signBoard = plot.Model:FindFirstChild("PlotSign")
+	if signBoard then
+		local board = signBoard:FindFirstChild("Board")
+		if board then
+			for _, gui in ipairs(board:GetChildren()) do
+				local label = gui:FindFirstChildOfClass("TextLabel")
+				if label then
+					label.Text = "BASE " .. player.Name
+				end
 			end
 		end
 	end
-end)
-
-----------------------------------------------------------------------
--- Ambient animation: ferris wheel, belt stripes, fountain foam
-----------------------------------------------------------------------
-
-local wheelAngle = 0
-local foamOrbs = {}
-for i = 1, 3 do
-	local orb = Instance.new("Part")
-	orb.Name = "FountainFoam" .. i
-	orb.Shape = Enum.PartType.Ball
-	orb.Size = Vector3.new(0.9, 0.9, 0.9)
-	orb.Color = Color3.fromRGB(230, 250, 255)
-	orb.Material = Enum.Material.Neon
-	orb.Anchored = true
-	orb.CanCollide = false
-	orb.Parent = refs.World
-	foamOrbs[i] = orb
+	player.CharacterAdded:Connect(function(character)
+		task.wait(0.2)
+		local rootPart = character:FindFirstChild("HumanoidRootPart")
+		if rootPart then
+			local front = Vector3.new(plot.Center.X, 2, plot.FrontZ)
+			rootPart.CFrame = CFrame.new(front, Vector3.new(0, 2, plot.Center.Z))
+		end
+	end)
+	if player.Character then
+		local rootPart = player.Character:FindFirstChild("HumanoidRootPart")
+		if rootPart then
+			rootPart.CFrame = CFrame.new(Vector3.new(plot.Center.X, 2, plot.FrontZ))
+		end
+	end
+	toastPlayer(player, "Selamat datang di Brainrot Bazaar! Beli brainrot di conveyor.")
+	syncPlayer(player)
 end
 
-RunService.Heartbeat:Connect(function(dt)
-	local now = os.clock()
-	MoveService.Update(dt, now)
+Players.PlayerAdded:Connect(onPlayerAdded)
+for _, player in ipairs(Players:GetPlayers()) do
+	task.spawn(onPlayerAdded, player)
+end
 
-	wheelAngle = (wheelAngle + dt * 0.12) % (math.pi * 2)
-	if refs.Wheel and refs.Wheel.PrimaryPart then
-		refs.Wheel:PivotTo(CFrame.new(refs.WheelHubPos) * CFrame.Angles(wheelAngle, 0, 0))
-	end
-	for _, stripe in ipairs(refs.Stripes) do
-		local x = stripe.Position.X + dt * 6
-		if x > 70 then
-			x = -70
+Players.PlayerRemoving:Connect(function(player)
+	local data = GameState.Get(player)
+	if data then
+		plotOwner[data.PlotIndex] = nil
+		for i = 1, GameState.PADS_PER_BASE do
+			GameState.RemoveFromPad(data, i)
 		end
-		stripe.Position = Vector3.new(x, stripe.Position.Y, stripe.Position.Z)
-	end
-	for i, orb in ipairs(foamOrbs) do
-		local a = now * 0.9 + i * (math.pi * 2 / 3)
-		orb.Position = Vector3.new(math.cos(a) * 5, 1.6 + math.sin(now * 2 + i) * 0.15, 44 + math.sin(a) * 5)
-	end
-	if refs.Beacon then
-		local pulse = 4 + math.sin(now * 3) * 0.5
-		refs.Beacon.Size = Vector3.new(pulse, pulse, pulse)
+		GameState.RemovePlayer(player)
 	end
 end)
 
-----------------------------------------------------------------------
--- Timed world events: income ticks, the thief, the tsunami, HUD sync
-----------------------------------------------------------------------
-
-local TSUNAMI_PERIOD = 180
-local TSUNAMI_WARNING = 10
-local nextTsunamiAt = os.clock() + TSUNAMI_PERIOD
-local tsunamiWarned = false
-local nextThiefAt = os.clock() + Thief.RAID_INTERVAL
-
-local function tsunamiSecondsLeft()
-	return math.max(0, math.ceil(nextTsunamiAt - os.clock()))
-end
-
-local function fireTsunami()
-	toastAll("TSUNAMI! Semua brainrot di sabuk hanyut! Pemain di luar basis hanyut!")
-	for model in pairs(beltModels) do
-		MoveService.Stop(model)
-		model:Destroy()
+-- Income tick + state sync ---------------------------------------------------
+task.spawn(function()
+	while true do
+		task.wait(1)
+		for _, data in pairs(GameState.Players) do
+			GameState.TickIncome(data, 1)
+		end
+		syncAll()
 	end
-	beltModels = {}
-	for _, player in ipairs(Players:GetPlayers()) do
-		local character = player.Character
-		local root = character and character:FindFirstChild("HumanoidRootPart")
-		local humanoid = character and character:FindFirstChildOfClass("Humanoid")
-		if root and humanoid and not WorldBuilder.PositionInAnyPlot(refs, root.Position) then
-			humanoid.Health = 0
+end)
+
+-- Belt spawner -----------------------------------------------------------------
+task.spawn(function()
+	task.wait(1)
+	while true do
+		spawnBeltBrainrot()
+		task.wait(2.6)
+	end
+end)
+
+-- Tsunami ------------------------------------------------------------------------
+local function playerInsideAnyBase(character)
+	local rootPart = character and character:FindFirstChild("HumanoidRootPart")
+	if not rootPart then
+		return false
+	end
+	local pos = rootPart.Position
+	for _, plot in ipairs(world.Plots) do
+		if math.abs(pos.X - plot.Center.X) <= 24 and math.abs(pos.Z - plot.Center.Z) <= 17 then
+			return true
 		end
 	end
+	return false
 end
 
 task.spawn(function()
 	while true do
-		task.wait(1)
-		local now = os.clock()
-		for _, state in pairs(GameState.Players) do
-			GameState.TickIncome(state, 1)
-			for _, pad in pairs(state.Pads) do
-				if pad.Model then
-					BrainrotFactory.SetStoredLabel(pad.Model, pad.Stored)
-				end
-			end
-			local plot = refs.Plots[state.PlotIndex]
-			if plot and plot.LockShield then
-				local locked = GameState.IsLocked(state)
-				plot.LockShield.Transparency = locked and 0.65 or 1
-				plot.LockShield.CanCollide = locked
-			end
-			stateSync:FireClient(state.Player, GameState.Snapshot(state,
-				tsunamiSecondsLeft(), math.max(0, math.ceil(nextThiefAt - now))))
+		local waitTime = nextTsunamiAt - GameState.Now() - TSUNAMI_WARNING
+		if waitTime > 0 then
+			task.wait(waitTime)
 		end
+		toastAll("TSUNAMI 10 detik lagi! Lari ke dalam base!")
+		task.wait(TSUNAMI_WARNING)
+		-- The wave washes away everything on or walking off the belt.
+		MoveService.CancelByTag("belt", true)
+		for model in pairs(beltModels) do
+			beltModels[model] = nil
+		end
+		for _, player in ipairs(Players:GetPlayers()) do
+			local character = player.Character
+			local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+			if humanoid and not playerInsideAnyBase(character) then
+				humanoid.Health = 0
+				toastPlayer(player, "Kamu tersapu tsunami!")
+			end
+		end
+		toastAll("Tsunami lewat! Conveyor mulai lagi.")
+		nextTsunamiAt = GameState.Now() + TSUNAMI_PERIOD
+		syncAll()
+	end
+end)
 
-		if not tsunamiWarned and nextTsunamiAt - now <= TSUNAMI_WARNING then
-			tsunamiWarned = true
-			toastAll("PERINGATAN: Tsunami datang dalam 10 detik! Masuk ke basis sekarang!")
+-- Plaza animation: fountain water spins, the ferris wheel turns. ---------------
+task.spawn(function()
+	local water = world.FountainWater
+	local waterBase = water.CFrame
+	local waterCenter = Vector3.new(WorldBuilder.Layout.Fountain.X, waterBase.Position.Y, WorldBuilder.Layout.Fountain.Z)
+	local spokes = {}
+	for _, child in ipairs(world.Folder:GetDescendants()) do
+		if child:IsA("BasePart") and child:GetAttribute("SpinWithWater") then
+			table.insert(spokes, { Part = child, Base = child.CFrame })
 		end
-		if now >= nextTsunamiAt then
-			fireTsunami()
-			nextTsunamiAt = now + TSUNAMI_PERIOD
-			tsunamiWarned = false
-		end
-		if now >= nextThiefAt then
-			nextThiefAt = now + Thief.RAID_INTERVAL
-			Thief.RunRaid(deps)
+	end
+	local wheel = world.FerrisWheel
+	local hubPos = world.WheelHub
+	local angle = 0
+	local waterAngle = 0
+	while true do
+		local dt = task.wait(0.05)
+		angle += dt * 0.18
+		waterAngle += dt * 0.5
+		wheel:PivotTo(CFrame.new(hubPos) * CFrame.Angles(angle, 0, 0))
+		water.CFrame = CFrame.new(waterCenter) * CFrame.Angles(0, waterAngle, 0) * (CFrame.new(waterCenter):Inverse() * waterBase)
+		for _, s in ipairs(spokes) do
+			s.Part.CFrame = CFrame.new(waterCenter) * CFrame.Angles(0, waterAngle, 0) * (CFrame.new(waterCenter):Inverse() * s.Base)
 		end
 	end
 end)
 
--- Startup layout audit: log the anchor positions from the same layout
--- constants WorldBuilder built from, so a bad coordinate is visible in
--- the server log before a player ever joins.
-for name, entry in pairs(WorldBuilder.Layout) do
-	if type(entry) == "table" and entry.X then
-		print(string.format("[BrainrotBazaar] Layout %s at (%d, %d) baseY=%d", name, entry.X, entry.Z, entry.BaseY))
-	end
+Thief.Start(ctx)
+
+print("Brainrot Bazaar server ready: " .. #world.Plots .. " bases, belt top Y=" .. BELT_TOP_Y)
+for _, line in ipairs(WorldBuilder.DescribeLayout()) do
+	print("[layout] " .. line)
 end
-for i, c in ipairs(WorldBuilder.Layout.PlotCenters) do
-	print(string.format("[BrainrotBazaar] Layout Plot%d at (%d, %d) baseY=%d", i, c.X, c.Z, c.BaseY))
+
+-- Server stats for the output log: live belt + walker counts on demand.
+local function serverStats()
+	return {
+		BeltWalking = MoveService.CountByTag("belt"),
+		WalkersActive = MoveService.ActiveCount(),
+		PlayersSeated = GameState and #Players:GetPlayers() or 0,
+		NextTsunamiIn = math.max(0, math.ceil(nextTsunamiAt - GameState.Now())),
+	}
 end
-print("[BrainrotBazaar] Server ready: 8 bases, belt shop, gacha, thief, tsunami.")
+_G.BrainrotBazaarStats = serverStats

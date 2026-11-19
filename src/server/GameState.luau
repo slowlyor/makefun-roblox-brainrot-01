@@ -1,180 +1,221 @@
--- GameState.luau -- the single home for all per-player state.
--- In-memory only (no DataStore): cash, pads, collection, locks, rebirths.
--- init.server.luau owns the loops; this module only holds and computes.
-
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local BrainrotData = require(ReplicatedStorage:WaitForChild("Shared"):WaitForChild("BrainrotData"))
+-- GameState.luau
+-- Brainrot Bazaar: the single home of all per-player state.
+-- Cash, pads, stored income, rebirths, locks and the collection set
+-- live here and nowhere else; services read and mutate through these
+-- functions so the rules (multiplier, costs) are written exactly once.
+-- Everything is in memory only: no DataStore, by design.
 
 local GameState = {}
 
-GameState.START_CASH = 150
+GameState.START_CASH = 100
 GameState.PADS_PER_BASE = 6
 GameState.LOCK_SECONDS = 60
-GameState.REBIRTH_BASE_COST = 10000
-GameState.REBIRTH_BONUS = 0.75 -- +0.75x income multiplier per rebirth
+GameState.REBIRTH_BONUS = 0.75
 
-GameState.Players = {} -- [userId] = state
-GameState.PlotOwners = {} -- [plotIndex] = userId
+-- [Player] -> data table
+GameState.Players = {}
+
+function GameState.Now()
+	return workspace:GetServerTimeNow()
+end
 
 function GameState.CreatePlayer(player, plotIndex)
-	local state = {
+	local data = {
 		Player = player,
-		UserId = player.UserId,
 		PlotIndex = plotIndex,
 		Cash = GameState.START_CASH,
 		Rebirths = 0,
-		Pads = {}, -- [padIndex] = { DefIndex, Mutation, Stored, Model }
-		Collection = {}, -- [defIndex] = true, everything ever owned
-		LockedUntil = 0,
+		Pads = {}, -- [padIndex] -> entry { DefId, Mutation, Price, Income, Stored }
+		PadModels = {}, -- [padIndex] -> Model standing on the pad
+		Collection = {}, -- [defId] -> true once ever owned
 		GachaRolls = 0,
+		LockUntil = 0,
+		TotalEarned = 0,
+		TotalBuys = 0,
 	}
-	GameState.Players[player.UserId] = state
-	GameState.PlotOwners[plotIndex] = player.UserId
-	return state
-end
-
-function GameState.RemovePlayer(player)
-	local state = GameState.Players[player.UserId]
-	if state then
-		GameState.PlotOwners[state.PlotIndex] = nil
-		GameState.Players[player.UserId] = nil
-	end
-	return state
+	GameState.Players[player] = data
+	return data
 end
 
 function GameState.Get(player)
-	return GameState.Players[player.UserId]
+	return GameState.Players[player]
 end
 
-function GameState.Multiplier(state)
-	return 1 + GameState.REBIRTH_BONUS * state.Rebirths
+function GameState.RemovePlayer(player)
+	GameState.Players[player] = nil
 end
 
-function GameState.RebirthCost(state)
-	return GameState.REBIRTH_BASE_COST * (3 ^ state.Rebirths)
+function GameState.Multiplier(data)
+	return 1 + GameState.REBIRTH_BONUS * data.Rebirths
 end
 
-function GameState.FreePad(state)
+function GameState.RebirthCost(data)
+	return 10000 * (3 ^ data.Rebirths)
+end
+
+-- Gacha price climbs with every roll the player has ever paid for.
+function GameState.GachaCost(data)
+	return math.floor(750 * (1.8 ^ data.GachaRolls) + 0.5)
+end
+
+function GameState.IsLocked(data)
+	return GameState.Now() < data.LockUntil
+end
+
+function GameState.LockSecondsLeft(data)
+	return math.max(0, math.ceil(data.LockUntil - GameState.Now()))
+end
+
+function GameState.FreePad(data)
 	for i = 1, GameState.PADS_PER_BASE do
-		if not state.Pads[i] then
+		if data.Pads[i] == nil then
 			return i
 		end
 	end
 	return nil
 end
 
-function GameState.OccupiedPads(state)
+function GameState.OccupiedCount(data)
 	local n = 0
-	for _ in pairs(state.Pads) do
+	for i = 1, GameState.PADS_PER_BASE do
+		if data.Pads[i] ~= nil then
+			n += 1
+		end
+	end
+	return n
+end
+
+-- Place an entry on a pad and remember the character as collected.
+function GameState.PlaceBrainrot(data, padIndex, entry)
+	entry.Stored = 0
+	data.Pads[padIndex] = entry
+	data.Collection[entry.DefId] = true
+	return entry
+end
+
+function GameState.RemoveFromPad(data, padIndex)
+	local entry = data.Pads[padIndex]
+	data.Pads[padIndex] = nil
+	local model = data.PadModels[padIndex]
+	data.PadModels[padIndex] = nil
+	if model then
+		model:Destroy()
+	end
+	return entry
+end
+
+function GameState.IncomePerSecond(data)
+	local sum = 0
+	for i = 1, GameState.PADS_PER_BASE do
+		local entry = data.Pads[i]
+		if entry then
+			sum += entry.Income
+		end
+	end
+	return math.floor(sum * GameState.Multiplier(data) + 0.5)
+end
+
+function GameState.StoredTotal(data)
+	local sum = 0
+	for i = 1, GameState.PADS_PER_BASE do
+		local entry = data.Pads[i]
+		if entry then
+			sum += entry.Stored
+		end
+	end
+	return math.floor(sum)
+end
+
+-- One income tick: every pad brainrot banks its share of cash.
+function GameState.TickIncome(data, dt)
+	local mult = GameState.Multiplier(data)
+	for i = 1, GameState.PADS_PER_BASE do
+		local entry = data.Pads[i]
+		if entry then
+			entry.Stored += entry.Income * mult * dt
+		end
+	end
+end
+
+-- The green collect pad harvests every pad's stored cash at once.
+function GameState.Collect(data)
+	local amount = GameState.StoredTotal(data)
+	if amount <= 0 then
+		return 0
+	end
+	for i = 1, GameState.PADS_PER_BASE do
+		local entry = data.Pads[i]
+		if entry then
+			entry.Stored = 0
+		end
+	end
+	data.Cash += amount
+	data.TotalEarned += amount
+	return amount
+end
+
+-- The richest single brainrot a player owns (the thief's target).
+function GameState.RichestPad(data)
+	local bestIndex = nil
+	local bestValue = -1
+	for i = 1, GameState.PADS_PER_BASE do
+		local entry = data.Pads[i]
+		if entry and entry.Price > bestValue then
+			bestValue = entry.Price
+			bestIndex = i
+		end
+	end
+	return bestIndex
+end
+
+function GameState.CollectionList(data)
+	local list = {}
+	for defId in pairs(data.Collection) do
+		table.insert(list, defId)
+	end
+	table.sort(list)
+	return list
+end
+
+function GameState.CollectionCount(data)
+	local n = 0
+	for _ in pairs(data.Collection) do
 		n += 1
 	end
 	return n
 end
 
--- Income per second across all pads, before the rebirth multiplier.
-function GameState.BaseIncomePerSecond(state)
-	local total = 0
-	for _, pad in pairs(state.Pads) do
-		total += BrainrotData.IncomeFor(pad.DefIndex, pad.Mutation)
+-- Rebirth: wipe cash and brainrots, keep the collection book and the
+-- permanent multiplier that Rebirths already encodes.
+function GameState.DoRebirth(data)
+	for i = 1, GameState.PADS_PER_BASE do
+		GameState.RemoveFromPad(data, i)
 	end
-	return total
+	data.Rebirths += 1
+	data.Cash = GameState.START_CASH
+	data.LockUntil = 0
+	return data.Rebirths
 end
 
-function GameState.IncomePerSecond(state)
-	return GameState.BaseIncomePerSecond(state) * GameState.Multiplier(state)
-end
-
-function GameState.StoredTotal(state)
-	local total = 0
-	for _, pad in pairs(state.Pads) do
-		total += pad.Stored
+-- Spend cash if the player can afford it; returns whether it spent.
+function GameState.TrySpend(data, amount)
+	if data.Cash < amount then
+		return false
 	end
-	return total
+	data.Cash -= amount
+	return true
 end
 
--- The pad holding the single most valuable brainrot (by purchase price):
--- this is what the thief NPC comes for.
-function GameState.RichestPad(state)
-	local bestIndex, bestValue = nil, -1
-	for i, pad in pairs(state.Pads) do
-		local value = BrainrotData.PriceFor(pad.DefIndex, pad.Mutation)
-		if value > bestValue then
-			bestIndex, bestValue = i, value
+-- A plain-data snapshot of the pads for debugging and state sync.
+function GameState.PadSnapshot(data)
+	local snap = {}
+	for i = 1, GameState.PADS_PER_BASE do
+		local entry = data.Pads[i]
+		if entry then
+			snap[i] = { DefId = entry.DefId, Mutation = entry.Mutation, Income = entry.Income, Stored = math.floor(entry.Stored) }
 		end
 	end
-	return bestIndex, bestValue
-end
-
-function GameState.IsLocked(state)
-	return os.clock() < state.LockedUntil
-end
-
-function GameState.LockSecondsLeft(state)
-	return math.max(0, math.ceil(state.LockedUntil - os.clock()))
-end
-
--- Add one second of income to every pad's stored cash.
-function GameState.TickIncome(state, dt)
-	local mult = GameState.Multiplier(state)
-	for _, pad in pairs(state.Pads) do
-		pad.Stored += BrainrotData.IncomeFor(pad.DefIndex, pad.Mutation) * mult * dt
-	end
-end
-
--- Harvest every pad into cash; returns the amount collected.
-function GameState.Collect(state)
-	local amount = 0
-	for _, pad in pairs(state.Pads) do
-		amount += math.floor(pad.Stored)
-		pad.Stored = 0
-	end
-	state.Cash += amount
-	return amount
-end
-
-function GameState.PlaceOnPad(state, padIndex, defIndex, mutationName, model)
-	state.Pads[padIndex] = {
-		DefIndex = defIndex, Mutation = mutationName, Stored = 0, Model = model,
-	}
-	state.Collection[defIndex] = true
-end
-
-function GameState.RemoveFromPad(state, padIndex)
-	local pad = state.Pads[padIndex]
-	state.Pads[padIndex] = nil
-	return pad
-end
-
--- Reset for a rebirth: cash back to the starter amount, pads emptied.
--- The caller destroys the pad models; collection history is KEPT, since
--- the Buku Koleksi records everything a player has ever owned.
-function GameState.ApplyRebirth(state)
-	state.Rebirths += 1
-	state.Cash = GameState.START_CASH
-	state.Pads = {}
-	state.LockedUntil = 0
-end
-
--- The table the client HUD and collection index render from.
-function GameState.Snapshot(state, tsunamiIn, thiefIn)
-	local collection = {}
-	for defIndex in pairs(state.Collection) do
-		table.insert(collection, defIndex)
-	end
-	table.sort(collection)
-	return {
-		Cash = math.floor(state.Cash),
-		IncomePerSecond = GameState.IncomePerSecond(state),
-		Stored = math.floor(GameState.StoredTotal(state)),
-		Rebirths = state.Rebirths,
-		Multiplier = GameState.Multiplier(state),
-		RebirthCost = GameState.RebirthCost(state),
-		LockLeft = GameState.LockSecondsLeft(state),
-		TsunamiIn = tsunamiIn,
-		ThiefIn = thiefIn,
-		Collection = collection,
-		PadsUsed = GameState.OccupiedPads(state),
-	}
+	return snap
 end
 
 return GameState

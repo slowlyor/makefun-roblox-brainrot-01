@@ -1,65 +1,130 @@
--- GachaService.luau -- the plaza gacha machine. Each roll costs more
--- than the last; the prize is a weighted-rarity brainrot that walks
--- from the machine to a free pad in the winner's base. If the base is
--- full the roll is refunded in full and nothing is charged.
-
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local BrainrotData = require(ReplicatedStorage:WaitForChild("Shared"):WaitForChild("BrainrotData"))
+-- GachaService.luau
+-- Brainrot Bazaar: the plaza gacha machine. Each roll costs more than
+-- the last, rolls a weighted rarity, and the prize brainrot walks
+-- from the machine across the plaza to a free pad in the winner's
+-- base. A full base is never charged: the roll refuses up front,
+-- which is the refund rule with no money ever leaving the wallet.
 
 local GachaService = {}
 
-GachaService.BASE_COST = 500
-GachaService.COST_GROWTH = 1.6 -- each roll costs 1.6x the previous one
+GachaService.WALK_SPEED = 9
 
-function GachaService.NextCost(state)
-	return math.floor(GachaService.BASE_COST * (GachaService.COST_GROWTH ^ state.GachaRolls))
+function GachaService.CanRoll(ctx, data)
+	if ctx.GameState.FreePad(data) == nil then
+		return false, "Base penuh! Jual atau rebirth dulu."
+	end
+	local cost = ctx.GameState.GachaCost(data)
+	if data.Cash < cost then
+		return false, "Uang kurang untuk gacha ($" .. cost .. ")."
+	end
+	return true, nil
 end
 
--- Attempt one roll for a player. deps: { GameState, BrainrotFactory,
--- MoveService, Refs, Rng, ToastPlayer, PlaceBrainrot } where
--- PlaceBrainrot(state, padIndex, model) settles a model onto its pad.
--- Returns true when a brainrot was won and sent walking home.
-function GachaService.Roll(state, deps)
-	local GameState = deps.GameState
-	local cost = GachaService.NextCost(state)
-	local padIndex = GameState.FreePad(state)
-	if not padIndex then
-		deps.ToastPlayer(state.Player, "Basis PENUH! Roll gacha dibatalkan, uang kembali.")
+function GachaService.Roll(ctx, player)
+	local data = ctx.GameState.Get(player)
+	if not data then
 		return false
 	end
-	if state.Cash < cost then
-		deps.ToastPlayer(state.Player, "Uang tidak cukup untuk gacha! Butuh " .. BrainrotData.FormatMoney(cost))
+	local ok, reason = GachaService.CanRoll(ctx, data)
+	if not ok then
+		ctx.ToastPlayer(player, reason)
 		return false
 	end
-
-	state.Cash -= cost
-	state.GachaRolls += 1
-
-	local defIndex = BrainrotData.RollCharacter(deps.Rng, BrainrotData.GachaWeights)
-	local mutation = BrainrotData.RollMutation(deps.Rng)
-	local machinePos = deps.Refs.GachaPos
-	local model = deps.BrainrotFactory.Create(defIndex, mutation.Name,
-		Vector3.new(machinePos.X, 0, machinePos.Z + 4))
-	model.Parent = deps.Refs.World
-
-	local c = BrainrotData.Get(defIndex)
-	local mutationNote = ""
-	if mutation.Name ~= "Normal" then
-		mutationNote = " Mutasi " .. mutation.Name .. " x" .. tostring(mutation.Multiplier) .. "!"
+	local padIndex = ctx.GameState.FreePad(data)
+	local plot = ctx.World.Plots[data.PlotIndex]
+	if not padIndex or not plot then
+		ctx.ToastPlayer(player, "Base penuh! Jual atau rebirth dulu.")
+		return false
 	end
-	deps.ToastPlayer(state.Player, string.format("GACHA: %s [%s] berjalan ke basismu!%s",
-		c.Name, string.upper(c.Rarity), mutationNote))
-
-	-- The prize walks home: plaza -> plot front -> its pad.
-	local plot = deps.Refs.Plots[state.PlotIndex]
-	local padPos = plot.PadPositions[padIndex]
-	deps.MoveService.WalkPath(model, {
-		{ X = padPos.X, Z = plot.Center.Z + plot.FrontDir * 20, BaseY = 0, Speed = 9 },
-		{ X = padPos.X, Z = padPos.Z, BaseY = 0.45, Speed = 9 },
-	}, function()
-		deps.PlaceBrainrot(state, padIndex, model)
-	end)
+	local cost = ctx.GameState.GachaCost(data)
+	data.Cash -= cost
+	data.GachaRolls += 1
+	local rng = ctx.Rng
+	local rarity = ctx.BrainrotData.RollRarity(ctx.BrainrotData.GACHA_WEIGHTS, rng)
+	local def = ctx.BrainrotData.RandomOfRarity(rarity, rng)
+	local mutation = ctx.BrainrotData.RollMutation(rng)
+	local entry = {
+		DefId = def.Id,
+		Mutation = mutation.Name,
+		Price = ctx.BrainrotData.PriceFor(def, mutation),
+		Income = ctx.BrainrotData.IncomeFor(def, mutation),
+		Stored = 0,
+	}
+	-- Reserve the pad at once so a second roll cannot target it too.
+	ctx.GameState.PlaceBrainrot(data, padIndex, entry)
+	local padPos = plot.Pads[padIndex]
+	local model = ctx.Factory.Create(def, mutation.Name)
+	model.Parent = workspace
+	local start = ctx.World.GachaPosition
+	model:PivotTo(CFrame.new(start.X, ctx.Factory.ROOT_LIFT, start.Z))
+	local mutText = mutation.Name ~= "Normal" and (" " .. mutation.Name) or ""
+	ctx.Factory.SetLabel(model, def.Name .. mutText, def.Rarity .. " - GACHA!", ctx.BrainrotData.RARITY_COLORS[def.Rarity])
+	if def.Rarity == "Divine" then
+		ctx.Factory.SparkleBurst(Vector3.new(start.X, 1, start.Z))
+		ctx.ToastAll(player.Name .. " menarik " .. def.Name .. " DIVINE dari gacha!")
+	else
+		ctx.ToastPlayer(player, "Gacha: " .. def.Name .. " (" .. def.Rarity .. mutText .. ") berjalan ke basemu!")
+	end
+	ctx.SyncPlayer(player)
+	ctx.MoveService.Add(model, {
+		Path = {
+			Vector3.new(start.X, 0, 44),
+			Vector3.new(padPos.X, 0, plot.Center.Z),
+			Vector3.new(padPos.X, 0, padPos.Z),
+		},
+		Speed = GachaService.WALK_SPEED,
+		PivotY = ctx.Factory.ROOT_LIFT,
+		Tag = "gacha",
+		OnArrive = function()
+			-- Swap the walker for the standing pad model.
+			model:Destroy()
+			if data.Pads[padIndex] == entry then
+				local placed = ctx.Factory.Create(def, mutation.Name)
+				placed.Parent = workspace
+				placed:PivotTo(CFrame.new(padPos.X, plot.Pads[padIndex].Y + ctx.Factory.ROOT_LIFT, padPos.Z))
+				ctx.Factory.SetLabel(placed, def.Name .. mutText, "$" .. entry.Income .. "/s", ctx.BrainrotData.RARITY_COLORS[def.Rarity])
+				data.PadModels[padIndex] = placed
+				if def.Rarity == "Divine" then
+					ctx.Factory.SparkleBurst(padPos + Vector3.new(0, 1, 0))
+				end
+			end
+			ctx.SyncPlayer(player)
+		end,
+		OnCancel = function()
+			-- Never lose a paid prize: if the walk is interrupted the
+			-- brainrot simply appears on its reserved pad.
+			if data.Pads[padIndex] == entry and not data.PadModels[padIndex] then
+				local placed = ctx.Factory.Create(def, mutation.Name)
+				placed.Parent = workspace
+				placed:PivotTo(CFrame.new(padPos.X, plot.Pads[padIndex].Y + ctx.Factory.ROOT_LIFT, padPos.Z))
+				ctx.Factory.SetLabel(placed, def.Name .. mutText, "$" .. entry.Income .. "/s", ctx.BrainrotData.RARITY_COLORS[def.Rarity])
+				data.PadModels[padIndex] = placed
+			end
+		end,
+	})
 	return true
+end
+
+-- The price of the roll after the next one, for "next: $X" labels.
+function GachaService.CostAfterNext(ctx, data)
+	local clone = { GachaRolls = data.GachaRolls + 1 }
+	return ctx.GameState.GachaCost(clone)
+end
+
+-- Rarity odds as percentages, for the machine's help text.
+function GachaService.OddsText(ctx)
+	local weights = ctx.BrainrotData.GACHA_WEIGHTS
+	local total = 0
+	for _, rarity in ipairs(ctx.BrainrotData.RARITIES) do
+		total += weights[rarity] or 0
+	end
+	local parts = {}
+	for i = #ctx.BrainrotData.RARITIES, 1, -1 do
+		local rarity = ctx.BrainrotData.RARITIES[i]
+		local pct = (weights[rarity] or 0) / total * 100
+		table.insert(parts, rarity .. " " .. string.format("%.0f", pct) .. "%")
+	end
+	return table.concat(parts, " - ")
 end
 
 return GachaService

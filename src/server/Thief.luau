@@ -1,74 +1,115 @@
--- Thief.luau -- the Pencuri Brainrot: an NPC who periodically sneaks
--- into the richest UNLOCKED base, grabs its most valuable brainrot and
--- runs off the map with it. Locked bases (and empty bases) are safe.
--- init.server.luau schedules the raids; this module runs one raid.
+-- Thief.luau
+-- Brainrot Bazaar: the thief NPC. Every so often he jogs in from the
+-- plaza, grabs the single richest brainrot sitting in any UNLOCKED
+-- base, and jogs off with it. A locked base is completely safe.
 
 local Thief = {}
 
-Thief.RAID_INTERVAL = 75 -- seconds between raids
-Thief.SPEED = 13 -- the thief runs faster than brainrots walk
+Thief.MIN_WAIT = 45
+Thief.MAX_WAIT = 75
+Thief.SPEED = 11
 
--- Find the best victim: the unlocked player whose richest pad brainrot
--- is worth the most. Returns (state, padIndex) or nil.
-function Thief.FindVictim(GameState)
-	local bestState, bestPad, bestValue = nil, nil, -1
-	for _, state in pairs(GameState.Players) do
-		if not GameState.IsLocked(state) then
-			local padIndex, value = GameState.RichestPad(state)
-			if padIndex and value > bestValue then
-				bestState, bestPad, bestValue = state, padIndex, value
+local function pickTarget(ctx)
+	local best = nil
+	for player, data in pairs(ctx.GameState.Players) do
+		if not ctx.GameState.IsLocked(data) then
+			local padIndex = ctx.GameState.RichestPad(data)
+			if padIndex then
+				local entry = data.Pads[padIndex]
+				if entry and (not best or entry.Price > best.Entry.Price) then
+					best = { Player = player, Data = data, PadIndex = padIndex, Entry = entry }
+				end
 			end
 		end
 	end
-	return bestState, bestPad, bestValue
+	return best
 end
 
--- Run one raid. deps carries the shared modules and world refs so this
--- module stays free of circular requires.
--- deps: { GameState, BrainrotFactory, MoveService, Refs, ToastAll, ToastPlayer }
-function Thief.RunRaid(deps)
-	local GameState = deps.GameState
-	local victim, padIndex = Thief.FindVictim(GameState)
-	if not victim then
-		return false
+local function runOnce(ctx)
+	local target = pickTarget(ctx)
+	if not target then
+		return
 	end
-	local pad = victim.Pads[padIndex]
-	if not pad or not pad.Model then
-		return false
+	local plot = ctx.World.Plots[target.Data.PlotIndex]
+	if not plot then
+		return
 	end
-
-	local plot = deps.Refs.Plots[victim.PlotIndex]
-	local padPos = plot.PadPositions[padIndex]
-	local spawnAt = Vector3.new(padPos.X, 0, padPos.Z + plot.FrontDir * 26)
-
-	deps.ToastAll("PENCURI DATANG! Dia mengincar basis yang tidak dikunci!")
-	local thief = deps.BrainrotFactory.CreateThief(spawnAt)
-	thief.Parent = deps.Refs.World
-
-	local stolenModel = pad.Model
-	-- If the victim locks the base mid-raid the thief gives up at the
-	-- shield; the check happens when he reaches the pad, below.
-	deps.MoveService.WalkTo(thief, padPos.X, padPos.Z, deps.MoveService.GROUND_Y, Thief.SPEED, function()
-		if GameState.IsLocked(victim) or victim.Pads[padIndex] == nil then
-			deps.ToastPlayer(victim.Player, "Pencuri kabur! Basismu terkunci tepat waktu.")
-			deps.MoveService.WalkTo(thief, spawnAt.X, spawnAt.Z, deps.MoveService.GROUND_Y, Thief.SPEED + 1, function()
-				thief:Destroy()
-			end)
-			return
-		end
-		-- Grab: the pad empties, the brainrot follows the thief out.
-		GameState.RemoveFromPad(victim, padIndex)
-		deps.ToastPlayer(victim.Player, "Brainrot terbesarmu DICURI pencuri! Kunci basismu!")
-		local exitX = padPos.X
-		local exitZ = padPos.Z + plot.FrontDir * 40
-		deps.MoveService.WalkTo(stolenModel, exitX, exitZ, deps.MoveService.GROUND_Y, Thief.SPEED, function()
-			stolenModel:Destroy()
-		end)
-		deps.MoveService.WalkTo(thief, exitX, exitZ, deps.MoveService.GROUND_Y, Thief.SPEED + 1, function()
+	local padPos = plot.Pads[target.PadIndex]
+	local thief = ctx.Factory.CreateThief()
+	thief.Name = "ThiefNPC"
+	thief.Parent = workspace
+	local startPos = Vector3.new(0, 0, 44)
+	thief:PivotTo(CFrame.new(startPos.X, ctx.Factory.ROOT_LIFT, startPos.Z))
+	ctx.Factory.SetLabel(thief, "PENCURI!", "jangan sampai lolos", Color3.fromRGB(255, 90, 90))
+	ctx.ToastAll("Pencuri datang! Kunci basemu!")
+	ctx.MoveService.Add(thief, {
+		Path = { Vector3.new(padPos.X, 0, padPos.Z) },
+		Speed = Thief.SPEED,
+		PivotY = ctx.Factory.ROOT_LIFT,
+		Tag = "thief",
+		OnArrive = function()
+			-- The base may have locked (or the pad emptied) on the way.
+			local data = target.Data
+			local stillThere = data.Pads[target.PadIndex] == target.Entry
+			if stillThere and not ctx.GameState.IsLocked(data) then
+				local def = ctx.BrainrotData.GetById(target.Entry.DefId)
+				ctx.GameState.RemoveFromPad(data, target.PadIndex)
+				if def then
+					ctx.ToastPlayer(target.Player, "Pencuri membawa lari " .. def.Name .. "!")
+				else
+					ctx.ToastPlayer(target.Player, "Pencuri membawa lari brainrot-mu!")
+				end
+				ctx.SyncPlayer(target.Player)
+			else
+				ctx.ToastPlayer(target.Player, "Pencuri gagal — basemu aman!")
+			end
+			-- Jog off to the map corner and vanish.
+			ctx.MoveService.Add(thief, {
+				Path = { Vector3.new(-176, 0, -138) },
+				Speed = Thief.SPEED + 2,
+				PivotY = ctx.Factory.ROOT_LIFT,
+				Tag = "thief",
+				OnArrive = function()
+					thief:Destroy()
+				end,
+				OnCancel = function()
+					thief:Destroy()
+				end,
+			})
+		end,
+		OnCancel = function()
 			thief:Destroy()
-		end)
+		end,
+	})
+end
+
+function Thief.Start(ctx)
+	task.spawn(function()
+		local rng = Random.new()
+		while true do
+			task.wait(rng:NextNumber(Thief.MIN_WAIT, Thief.MAX_WAIT))
+			local ok, err = pcall(runOnce, ctx)
+			if not ok then
+				warn("Thief failed: " .. tostring(err))
+			end
+		end
 	end)
-	return true
+end
+
+-- Run one theft immediately (used by tests and admin tooling); the
+-- scheduled loop in Start is the normal driver.
+function Thief.RunOnce(ctx)
+	local ok, err = pcall(runOnce, ctx)
+	if not ok then
+		warn("Thief.RunOnce failed: " .. tostring(err))
+	end
+	return ok
+end
+
+-- Who would the thief rob right now? Nil when every base is locked
+-- or empty.
+function Thief.NextTarget(ctx)
+	return pickTarget(ctx)
 end
 
 return Thief
