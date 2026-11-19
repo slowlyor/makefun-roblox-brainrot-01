@@ -1,1 +1,46 @@
-{"name":"brainrot-bazaar","tree":{"$className":"DataModel","Lighting":{"$properties":{"Ambient":[0.45,0.45,0.5],"Brightness":2,"GlobalShadows":true,"Outlines":false,"Technology":"Voxel"}},"Players":{"$properties":{"CharacterAutoLoads":true}},"ReplicatedStorage":{"Shared":{"$path":"src/shared"}},"ServerScriptService":{"Server":{"$path":"src/server"}},"SoundService":{"$properties":{"RespectFilteringEnabled":true}},"StarterPlayer":{"StarterPlayerScripts":{"Client":{"$path":"src/client"}}},"Workspace":{"$properties":{"FilteringEnabled":true}}}}
+{
+  "name": "brainrot-bazaar",
+  "tree": {
+    "$className": "DataModel",
+    "Lighting": {
+      "$properties": {
+        "Ambient": [
+          0.2,
+          0.2,
+          0.25
+        ],
+        "Brightness": 2,
+        "GlobalShadows": true,
+        "Outlines": false,
+        "Technology": "Voxel"
+      }
+    },
+    "ReplicatedStorage": {
+      "Shared": {
+        "$path": "src/shared"
+      }
+    },
+    "ServerScriptService": {
+      "Server": {
+        "$path": "src/server"
+      }
+    },
+    "SoundService": {
+      "$properties": {
+        "RespectFilteringEnabled": true
+      }
+    },
+    "StarterPlayer": {
+      "StarterPlayerScripts": {
+        "Client": {
+          "$path": "src/client"
+        }
+      }
+    },
+    "Workspace": {
+      "$properties": {
+        "FilteringEnabled": true
+      }
+    }
+  }
+}

@@ -1,221 +1,142 @@
--- GameState.luau
--- Brainrot Bazaar: the single home of all per-player state.
--- Cash, pads, stored income, rebirths, locks and the collection set
--- live here and nowhere else; services read and mutate through these
--- functions so the rules (multiplier, costs) are written exactly once.
--- Everything is in memory only: no DataStore, by design.
+-- GameState: in-memory player data only (nothing is saved between sessions).
+-- Cash is spendable money; Stored is unclaimed income on the base's collect pad.
+
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
 local GameState = {}
 
-GameState.START_CASH = 100
-GameState.PADS_PER_BASE = 6
-GameState.LOCK_SECONDS = 60
-GameState.REBIRTH_BONUS = 0.75
+GameState.START_CASH = 150
+GameState.REBIRTH_BASE_COST = 10000
+GameState.REBIRTH_COST_MULT = 3
+GameState.REBIRTH_BONUS = 0.75 -- +0.75x income multiplier per rebirth
 
--- [Player] -> data table
-GameState.Players = {}
+local players = {} -- [Player] = data
 
-function GameState.Now()
-	return workspace:GetServerTimeNow()
+local function newData()
+	return {
+		cash = GameState.START_CASH,
+		stored = 0,
+		rebirths = 0,
+		rolls = 0,
+		plotIndex = 0,
+		lockedUntil = 0,
+		owned = {}, -- [charId] = true, for the Collection Index
+		pads = {}, -- [padIndex] = brainrot Model (or nil)
+	}
 end
 
-function GameState.CreatePlayer(player, plotIndex)
-	local data = {
-		Player = player,
-		PlotIndex = plotIndex,
-		Cash = GameState.START_CASH,
-		Rebirths = 0,
-		Pads = {}, -- [padIndex] -> entry { DefId, Mutation, Price, Income, Stored }
-		PadModels = {}, -- [padIndex] -> Model standing on the pad
-		Collection = {}, -- [defId] -> true once ever owned
-		GachaRolls = 0,
-		LockUntil = 0,
-		TotalEarned = 0,
-		TotalBuys = 0,
-	}
-	GameState.Players[player] = data
+function GameState.get(player)
+	return players[player]
+end
+
+function GameState.addPlayer(player)
+	local data = newData()
+	players[player] = data
 	return data
 end
 
-function GameState.Get(player)
-	return GameState.Players[player]
+function GameState.removePlayer(player)
+	players[player] = nil
 end
 
-function GameState.RemovePlayer(player)
-	GameState.Players[player] = nil
+function GameState.allPlayers()
+	return players
 end
 
-function GameState.Multiplier(data)
-	return 1 + GameState.REBIRTH_BONUS * data.Rebirths
+function GameState.multiplier(data)
+	return 1 + GameState.REBIRTH_BONUS * data.rebirths
 end
 
-function GameState.RebirthCost(data)
-	return 10000 * (3 ^ data.Rebirths)
+function GameState.rebirthCost(data)
+	return GameState.REBIRTH_BASE_COST * (GameState.REBIRTH_COST_MULT ^ data.rebirths)
 end
 
--- Gacha price climbs with every roll the player has ever paid for.
-function GameState.GachaCost(data)
-	return math.floor(750 * (1.8 ^ data.GachaRolls) + 0.5)
+function GameState.gachaCost(data)
+	return 500 * (data.rolls + 1)
 end
 
-function GameState.IsLocked(data)
-	return GameState.Now() < data.LockUntil
+function GameState.incomePerSecond(data)
+	local total = 0
+	for _, model in pairs(data.pads) do
+		if model and model.Parent then
+			total = total + (model:GetAttribute("Income") or 0)
+		end
+	end
+	return math.floor(total * GameState.multiplier(data) + 0.5)
 end
 
-function GameState.LockSecondsLeft(data)
-	return math.max(0, math.ceil(data.LockUntil - GameState.Now()))
-end
-
-function GameState.FreePad(data)
-	for i = 1, GameState.PADS_PER_BASE do
-		if data.Pads[i] == nil then
+function GameState.freePadIndex(data)
+	for i = 1, 6 do
+		if data.pads[i] == nil then
 			return i
 		end
 	end
 	return nil
 end
 
-function GameState.OccupiedCount(data)
+function GameState.ownedCount(data)
 	local n = 0
-	for i = 1, GameState.PADS_PER_BASE do
-		if data.Pads[i] ~= nil then
-			n += 1
-		end
+	for _ in pairs(data.owned) do
+		n = n + 1
 	end
 	return n
 end
 
--- Place an entry on a pad and remember the character as collected.
-function GameState.PlaceBrainrot(data, padIndex, entry)
-	entry.Stored = 0
-	data.Pads[padIndex] = entry
-	data.Collection[entry.DefId] = true
-	return entry
+-- The owned character ids, as a plain array the client can read.
+local function ownedIds(data)
+	local out = {}
+	for id in pairs(data.owned) do
+		table.insert(out, id)
+	end
+	return out
 end
 
-function GameState.RemoveFromPad(data, padIndex)
-	local entry = data.Pads[padIndex]
-	data.Pads[padIndex] = nil
-	local model = data.PadModels[padIndex]
-	data.PadModels[padIndex] = nil
-	if model then
-		model:Destroy()
+-- RemoteEvents, created once by init and shared by the server modules.
+function GameState.createRemotes()
+	local remotes = Instance.new("Folder")
+	remotes.Name = "Remotes"
+	remotes.Parent = ReplicatedStorage
+	local names = {
+		"BuyBrainrot", "CollectCash", "ToggleLock", "Rebirth", "GachaRoll",
+		"StateUpdate", "Toast", "TsunamiWarning",
+	}
+	local out = {}
+	for _, name in ipairs(names) do
+		local ev = Instance.new("RemoteEvent")
+		ev.Name = name
+		ev.Parent = remotes
+		out[name] = ev
 	end
-	return entry
+	return out
 end
 
-function GameState.IncomePerSecond(data)
-	local sum = 0
-	for i = 1, GameState.PADS_PER_BASE do
-		local entry = data.Pads[i]
-		if entry then
-			sum += entry.Income
-		end
+-- Push a HUD snapshot to one player.
+function GameState.pushState(remotes, player)
+	local data = players[player]
+	if not data then
+		return
 	end
-	return math.floor(sum * GameState.Multiplier(data) + 0.5)
+	remotes.StateUpdate:FireClient(player, {
+		cash = data.cash,
+		stored = data.stored,
+		income = GameState.incomePerSecond(data),
+		rebirths = data.rebirths,
+		multiplier = GameState.multiplier(data),
+		rebirthCost = GameState.rebirthCost(data),
+		gachaCost = GameState.gachaCost(data),
+		locked = os.time() < data.lockedUntil,
+		ownedCount = GameState.ownedCount(data),
+		plotIndex = data.plotIndex,
+		ownedIds = ownedIds(data),
+	})
 end
 
-function GameState.StoredTotal(data)
-	local sum = 0
-	for i = 1, GameState.PADS_PER_BASE do
-		local entry = data.Pads[i]
-		if entry then
-			sum += entry.Stored
-		end
-	end
-	return math.floor(sum)
+function GameState.toast(remotes, player, text)
+	remotes.Toast:FireClient(player, text)
 end
 
--- One income tick: every pad brainrot banks its share of cash.
-function GameState.TickIncome(data, dt)
-	local mult = GameState.Multiplier(data)
-	for i = 1, GameState.PADS_PER_BASE do
-		local entry = data.Pads[i]
-		if entry then
-			entry.Stored += entry.Income * mult * dt
-		end
-	end
-end
-
--- The green collect pad harvests every pad's stored cash at once.
-function GameState.Collect(data)
-	local amount = GameState.StoredTotal(data)
-	if amount <= 0 then
-		return 0
-	end
-	for i = 1, GameState.PADS_PER_BASE do
-		local entry = data.Pads[i]
-		if entry then
-			entry.Stored = 0
-		end
-	end
-	data.Cash += amount
-	data.TotalEarned += amount
-	return amount
-end
-
--- The richest single brainrot a player owns (the thief's target).
-function GameState.RichestPad(data)
-	local bestIndex = nil
-	local bestValue = -1
-	for i = 1, GameState.PADS_PER_BASE do
-		local entry = data.Pads[i]
-		if entry and entry.Price > bestValue then
-			bestValue = entry.Price
-			bestIndex = i
-		end
-	end
-	return bestIndex
-end
-
-function GameState.CollectionList(data)
-	local list = {}
-	for defId in pairs(data.Collection) do
-		table.insert(list, defId)
-	end
-	table.sort(list)
-	return list
-end
-
-function GameState.CollectionCount(data)
-	local n = 0
-	for _ in pairs(data.Collection) do
-		n += 1
-	end
-	return n
-end
-
--- Rebirth: wipe cash and brainrots, keep the collection book and the
--- permanent multiplier that Rebirths already encodes.
-function GameState.DoRebirth(data)
-	for i = 1, GameState.PADS_PER_BASE do
-		GameState.RemoveFromPad(data, i)
-	end
-	data.Rebirths += 1
-	data.Cash = GameState.START_CASH
-	data.LockUntil = 0
-	return data.Rebirths
-end
-
--- Spend cash if the player can afford it; returns whether it spent.
-function GameState.TrySpend(data, amount)
-	if data.Cash < amount then
-		return false
-	end
-	data.Cash -= amount
-	return true
-end
-
--- A plain-data snapshot of the pads for debugging and state sync.
-function GameState.PadSnapshot(data)
-	local snap = {}
-	for i = 1, GameState.PADS_PER_BASE do
-		local entry = data.Pads[i]
-		if entry then
-			snap[i] = { DefId = entry.DefId, Mutation = entry.Mutation, Income = entry.Income, Stored = math.floor(entry.Stored) }
-		end
-	end
-	return snap
+function GameState.toastAll(remotes, text)
+	remotes.Toast:FireAllClients(text)
 end
 
 return GameState

@@ -1,115 +1,142 @@
--- Thief.luau
--- Brainrot Bazaar: the thief NPC. Every so often he jogs in from the
--- plaza, grabs the single richest brainrot sitting in any UNLOCKED
--- base, and jogs off with it. A locked base is completely safe.
+-- Thief: a sneaky NPC that periodically steals the richest brainrot from an
+-- UNLOCKED base. Locked bases (60s seal) are safe. The thief walks in from the
+-- map edge, grabs the brainrot, and walks away with it.
 
 local Thief = {}
 
-Thief.MIN_WAIT = 45
-Thief.MAX_WAIT = 75
-Thief.SPEED = 11
+Thief.INTERVAL = 90 -- seconds between theft attempts
 
-local function pickTarget(ctx)
-	local best = nil
-	for player, data in pairs(ctx.GameState.Players) do
-		if not ctx.GameState.IsLocked(data) then
-			local padIndex = ctx.GameState.RichestPad(data)
-			if padIndex then
-				local entry = data.Pads[padIndex]
-				if entry and (not best or entry.Price > best.Entry.Price) then
-					best = { Player = player, Data = data, PadIndex = padIndex, Entry = entry }
+local function buildThiefModel()
+	local model = Instance.new("Model")
+	model.Name = "Maling Brainrot"
+	local body = Instance.new("Part")
+	body.Name = "Body"
+	body.Shape = Enum.PartType.Block
+	body.Size = Vector3.new(2, 3, 1.4)
+	body.Color = Color3.fromRGB(40, 40, 45)
+	body.Material = Enum.Material.SmoothPlastic
+	body.Anchored = true
+	body.CanCollide = false
+	body.Parent = model
+	local head = Instance.new("Part")
+	head.Name = "Head"
+	head.Shape = Enum.PartType.Ball
+	head.Size = Vector3.new(1.6, 1.6, 1.6)
+	head.Position = Vector3.new(0, 2.2, 0)
+	head.Color = Color3.fromRGB(40, 40, 45)
+	head.Anchored = true
+	head.CanCollide = false
+	head.Parent = model
+	local mask = Instance.new("Part")
+	mask.Name = "Mask"
+	mask.Shape = Enum.PartType.Block
+	mask.Size = Vector3.new(1.4, 0.5, 0.3)
+	mask.Position = Vector3.new(0, 2.3, 0.8)
+	mask.Color = Color3.fromRGB(20, 20, 20)
+	mask.Anchored = true
+	mask.CanCollide = false
+	mask.Parent = model
+	local sack = Instance.new("Part")
+	sack.Name = "Sack"
+	sack.Shape = Enum.PartType.Ball
+	sack.Size = Vector3.new(1.4, 1.4, 1.4)
+	sack.Position = Vector3.new(1.3, 0.5, 0)
+	sack.Color = Color3.fromRGB(150, 110, 60)
+	sack.Material = Enum.Material.Fabric
+	sack.Anchored = true
+	sack.CanCollide = false
+	sack.Parent = model
+	model.PrimaryPart = body
+	return model
+end
+
+-- Attempt one theft. `ctx` carries: plots, gameState, remotes, moveService, lift.
+-- Returns true when a brainrot was stolen.
+function Thief.attempt(ctx)
+	local now = os.time()
+	local candidates = {}
+	for player, data in pairs(ctx.gameState.allPlayers()) do
+		if data.plotIndex > 0 and now >= data.lockedUntil then
+			local richestPad, richestIncome = nil, 0
+			for padIndex, model in pairs(data.pads) do
+				if model and model.Parent then
+					local income = model:GetAttribute("Income") or 0
+					if income > richestIncome then
+						richestIncome = income
+						richestPad = padIndex
+					end
 				end
+			end
+			if richestPad then
+				table.insert(candidates, { player = player, data = data, pad = richestPad })
 			end
 		end
 	end
-	return best
-end
+	if #candidates == 0 then
+		return false
+	end
 
-local function runOnce(ctx)
-	local target = pickTarget(ctx)
-	if not target then
-		return
+	local pick = candidates[math.random(1, #candidates)]
+	local data = pick.data
+	local victimModel = data.pads[pick.pad]
+	local plot = ctx.plots[data.plotIndex]
+	if not victimModel or not plot then
+		return false
 	end
-	local plot = ctx.World.Plots[target.Data.PlotIndex]
-	if not plot then
-		return
+
+	local padPos = plot.pads[pick.pad].Position
+	data.pads[pick.pad] = nil
+
+	local thief = buildThiefModel()
+	thief.Parent = game:GetService("Workspace")
+	-- Walk in from the nearest map edge, XZ only, Y pinned to 0 + lift.
+	local startX = padPos.X + 60
+	if padPos.X > 0 then
+		startX = padPos.X - 60
 	end
-	local padPos = plot.Pads[target.PadIndex]
-	local thief = ctx.Factory.CreateThief()
-	thief.Name = "ThiefNPC"
-	thief.Parent = workspace
-	local startPos = Vector3.new(0, 0, 44)
-	thief:PivotTo(CFrame.new(startPos.X, ctx.Factory.ROOT_LIFT, startPos.Z))
-	ctx.Factory.SetLabel(thief, "PENCURI!", "jangan sampai lolos", Color3.fromRGB(255, 90, 90))
-	ctx.ToastAll("Pencuri datang! Kunci basemu!")
-	ctx.MoveService.Add(thief, {
-		Path = { Vector3.new(padPos.X, 0, padPos.Z) },
-		Speed = Thief.SPEED,
-		PivotY = ctx.Factory.ROOT_LIFT,
-		Tag = "thief",
-		OnArrive = function()
-			-- The base may have locked (or the pad emptied) on the way.
-			local data = target.Data
-			local stillThere = data.Pads[target.PadIndex] == target.Entry
-			if stillThere and not ctx.GameState.IsLocked(data) then
-				local def = ctx.BrainrotData.GetById(target.Entry.DefId)
-				ctx.GameState.RemoveFromPad(data, target.PadIndex)
-				if def then
-					ctx.ToastPlayer(target.Player, "Pencuri membawa lari " .. def.Name .. "!")
-				else
-					ctx.ToastPlayer(target.Player, "Pencuri membawa lari brainrot-mu!")
-				end
-				ctx.SyncPlayer(target.Player)
-			else
-				ctx.ToastPlayer(target.Player, "Pencuri gagal — basemu aman!")
-			end
-			-- Jog off to the map corner and vanish.
-			ctx.MoveService.Add(thief, {
-				Path = { Vector3.new(-176, 0, -138) },
-				Speed = Thief.SPEED + 2,
-				PivotY = ctx.Factory.ROOT_LIFT,
-				Tag = "thief",
-				OnArrive = function()
-					thief:Destroy()
-				end,
-				OnCancel = function()
-					thief:Destroy()
-				end,
-			})
-		end,
-		OnCancel = function()
+	thief:PivotTo(CFrame.new(startX, 1.8, padPos.Z))
+	ctx.gameState.toast(ctx.remotes, pick.player, "MALING! Ada yang nyuri brainrot kamu, lari ke base!")
+	ctx.gameState.toastAll(ctx.remotes, "Seorang maling mengincar base yang tidak terkunci!")
+
+	ctx.moveService.walkTo(thief, 1.8, Vector3.new(padPos.X, 0, padPos.Z), function()
+		-- Grab the brainrot and run away with it.
+		if victimModel.Parent then
+			-- Carry it above the thief's head while fleeing.
+			victimModel:PivotTo(thief:GetPivot() * CFrame.new(0, 3.2, 0))
+			victimModel.Parent = thief
+		end
+		local fleeX = padPos.X + 80
+		if padPos.X > 0 then
+			fleeX = padPos.X - 80
+		end
+		ctx.moveService.walkTo(thief, 1.8, Vector3.new(fleeX, 0, padPos.Z + 30), function()
 			thief:Destroy()
-		end,
-	})
+		end)
+		task.delay(12, function()
+			if thief.Parent then
+				thief:Destroy()
+			end
+		end)
+	end)
+	task.delay(30, function()
+		if thief.Parent then
+			thief:Destroy()
+		end
+	end)
+	return true
 end
 
-function Thief.Start(ctx)
+-- The theft loop: one attempt every INTERVAL seconds.
+function Thief.startLoop(ctx)
 	task.spawn(function()
-		local rng = Random.new()
 		while true do
-			task.wait(rng:NextNumber(Thief.MIN_WAIT, Thief.MAX_WAIT))
-			local ok, err = pcall(runOnce, ctx)
+			task.wait(Thief.INTERVAL)
+			local ok, err = pcall(Thief.attempt, ctx)
 			if not ok then
-				warn("Thief failed: " .. tostring(err))
+				warn("Thief attempt failed: " .. tostring(err))
 			end
 		end
 	end)
-end
-
--- Run one theft immediately (used by tests and admin tooling); the
--- scheduled loop in Start is the normal driver.
-function Thief.RunOnce(ctx)
-	local ok, err = pcall(runOnce, ctx)
-	if not ok then
-		warn("Thief.RunOnce failed: " .. tostring(err))
-	end
-	return ok
-end
-
--- Who would the thief rob right now? Nil when every base is locked
--- or empty.
-function Thief.NextTarget(ctx)
-	return pickTarget(ctx)
 end
 
 return Thief

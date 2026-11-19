@@ -1,167 +1,100 @@
--- MoveService.luau
--- Brainrot Bazaar: walks Models along XZ waypoints.
--- The one rule that keeps walkers glued to their floor: a walker's
--- pivot Y comes ONLY from the PivotY it registered with (belt top +
--- lift, or ground + lift). The model's current Y is never read back
--- into its height, so a walker can never sink or float away.
+-- MoveService: moves brainrots. XZ-plane steering only.
+-- The pivot Y is pinned absolutely from the target (belt riders: belt top 1.3
+-- + lift; ground walkers: 0 + lift). Current Y is NEVER fed back into height.
 
 local RunService = game:GetService("RunService")
 
 local MoveService = {}
 
-MoveService.Walkers = {}
-local connection = nil
+local BELT_SPEED = 4 -- studs per second along the belt
+local WALK_SPEED = 7 -- studs per second on the ground
 
-local function stepWalker(walker, dt)
-	local model = walker.Model
-	if not model or not model.Parent then
-		walker.Dead = true
-		return
+-- Place a model pivot at (x, absoluteY, z), facing +X (belt) or a heading.
+local function placeAt(model, x, y, z, headingX, headingZ)
+	local cf = CFrame.new(x, y, z)
+	if headingX ~= nil and (headingX ~= 0 or headingZ ~= 0) then
+		cf = CFrame.lookAt(Vector3.new(x, y, z), Vector3.new(x + headingX, y, z + headingZ))
 	end
-	local target = walker.Path[walker.Index]
-	if not target then
-		walker.Dead = true
-		if walker.OnArrive then
-			walker.OnArrive(walker)
-		end
-		return
-	end
-	local pivot = model:GetPivot()
-	local dx = target.X - pivot.X
-	local dz = target.Z - pivot.Z
-	local dist = math.sqrt(dx * dx + dz * dz)
-	local step = walker.Speed * dt
-	if dist <= math.max(step, 0.05) then
-		-- Land exactly on the waypoint, still at the pinned height.
-		local pos = Vector3.new(target.X, walker.PivotY, target.Z)
-		if dist > 0.001 then
-			model:PivotTo(CFrame.lookAt(pos, Vector3.new(target.X + dx, walker.PivotY, target.Z + dz)))
-		else
-			model:PivotTo(CFrame.new(pos) * (pivot - pivot.Position))
-		end
-		walker.Index += 1
-		if walker.Index > #walker.Path then
-			walker.Dead = true
-			if walker.OnArrive then
-				walker.OnArrive(walker)
-			end
-		end
-		return
-	end
-	local nx = pivot.X + dx / dist * step
-	local nz = pivot.Z + dz / dist * step
-	local pos = Vector3.new(nx, walker.PivotY, nz)
-	local ahead = Vector3.new(nx + dx, walker.PivotY, nz + dz)
-	model:PivotTo(CFrame.lookAt(pos, ahead))
-	-- A gentle bob and foot shuffle sell the walk without touching Y.
-	walker.BobPhase = (walker.BobPhase or 0) + dt * 9
-	local footL = model:FindFirstChild("FootL")
-	local footR = model:FindFirstChild("FootR")
-	if footL and footR then
-		local swing = math.sin(walker.BobPhase) * 0.3
-		local base = model:GetPivot()
-		footL.Position = base:PointToWorldSpace(Vector3.new(-0.55, -0.8, -0.1 + swing))
-		footR.Position = base:PointToWorldSpace(Vector3.new(0.55, -0.8, -0.1 - swing))
-	end
+	model:PivotTo(cf)
 end
 
--- Register a walker. opts: { Path = {Vector3,...}, Speed, PivotY,
--- OnArrive = fn(walker), OnCancel = fn(walker), Tag = string }
-function MoveService.Add(model, opts)
-	local walker = {
-		Model = model,
-		Path = opts.Path,
-		Index = 1,
-		Speed = opts.Speed or 7,
-		PivotY = opts.PivotY,
-		OnArrive = opts.OnArrive,
-		OnCancel = opts.OnCancel,
-		Tag = opts.Tag,
-		Dead = false,
-		BobPhase = 0,
-		Extra = opts.Extra,
-	}
-	table.insert(MoveService.Walkers, walker)
-	return walker
-end
-
-function MoveService.Remove(walker, destroyModel)
-	walker.Dead = true
-	if destroyModel and walker.Model then
-		walker.Model:Destroy()
-	end
-end
-
-function MoveService.FindByModel(model)
-	for _, walker in ipairs(MoveService.Walkers) do
-		if walker.Model == model and not walker.Dead then
-			return walker
+-- One belt rider: walks +X from xMin to xMax at beltTopY + lift.
+-- Returns a handle with .stop() and .finished (true when it reached the end).
+function MoveService.startBeltRide(model, beltTopY, lift, xMin, xMax, z)
+	local handle = { finished = false, stopped = false }
+	local x = xMin
+	placeAt(model, x, beltTopY + lift, z, 1, 0)
+	local conn
+	conn = RunService.Heartbeat:Connect(function(dt)
+		if handle.stopped then
+			conn:Disconnect()
+			return
 		end
-	end
-	return nil
-end
-
--- Cancel every walker with a tag (the tsunami uses Tag = "belt").
--- onCancel decides whether the model is destroyed or just stopped.
-function MoveService.CancelByTag(tag, destroyModel)
-	local cancelled = {}
-	for _, walker in ipairs(MoveService.Walkers) do
-		if walker.Tag == tag and not walker.Dead then
-			walker.Dead = true
-			table.insert(cancelled, walker)
-			if walker.OnCancel then
-				walker.OnCancel(walker)
-			end
-			if destroyModel and walker.Model then
-				walker.Model:Destroy()
-			end
+		x = x + BELT_SPEED * dt
+		if x >= xMax then
+			handle.finished = true
+			handle.stopped = true
+			conn:Disconnect()
+			return
 		end
-	end
-	return cancelled
-end
-
-function MoveService.CountByTag(tag)
-	local n = 0
-	for _, walker in ipairs(MoveService.Walkers) do
-		if walker.Tag == tag and not walker.Dead then
-			n += 1
-		end
-	end
-	return n
-end
-
-function MoveService.Start()
-	if connection then
-		return
-	end
-	connection = RunService.Heartbeat:Connect(function(dt)
-		for i = #MoveService.Walkers, 1, -1 do
-			local walker = MoveService.Walkers[i]
-			if walker.Dead then
-				table.remove(MoveService.Walkers, i)
-			else
-				stepWalker(walker, dt)
-			end
-		end
+		placeAt(model, x, beltTopY + lift, z, 1, 0)
 	end)
-end
-
-function MoveService.ActiveCount()
-	local n = 0
-	for _, walker in ipairs(MoveService.Walkers) do
-		if not walker.Dead then
-			n += 1
+	function handle.stop()
+		handle.stopped = true
+		if conn then
+			conn:Disconnect()
 		end
 	end
-	return n
+	return handle
 end
 
--- Stop every walker without destroying its model (used when a round
--- or a service shuts down and the models are cleaned up elsewhere).
-function MoveService.StopAll()
-	for _, walker in ipairs(MoveService.Walkers) do
-		walker.Dead = true
+-- Walk a model on the ground from its current XZ to a target XZ.
+-- onArrive fires once when it gets within 0.6 studs. Returns a handle with .stop().
+function MoveService.walkTo(model, lift, targetXZ, onArrive)
+	local handle = { stopped = false, arrived = false }
+	local conn
+	conn = RunService.Heartbeat:Connect(function(dt)
+		if handle.stopped then
+			conn:Disconnect()
+			return
+		end
+		local pivot = model:GetPivot()
+		local px, pz = pivot.X, pivot.Z
+		local dx, dz = targetXZ.X - px, targetXZ.Z - pz
+		local dist = math.sqrt(dx * dx + dz * dz)
+		if dist <= 0.6 then
+			handle.arrived = true
+			handle.stopped = true
+			conn:Disconnect()
+			if onArrive then
+				onArrive()
+			end
+			return
+		end
+		local step = math.min(WALK_SPEED * dt, dist)
+		local nx = px + (dx / dist) * step
+		local nz = pz + (dz / dist) * step
+		-- Y pinned to 0 + lift; heading from the XZ direction only.
+		placeAt(model, nx, lift, nz, dx / dist, dz / dist)
+	end)
+	function handle.stop()
+		handle.stopped = true
+		if conn then
+			conn:Disconnect()
+		end
 	end
+	return handle
+end
+
+-- Hop a model straight to a pad (used for the final snap onto a pad).
+function MoveService.snapToPad(model, lift, padPos)
+	placeAt(model, padPos.X, lift, padPos.Z, 0, 1)
+end
+
+-- Current XZ of a model, as a Vector3 with Y forced to 0 (height never leaks in).
+function MoveService.groundXZ(model)
+	local pivot = model:GetPivot()
+	return Vector3.new(pivot.X, 0, pivot.Z)
 end
 
 return MoveService

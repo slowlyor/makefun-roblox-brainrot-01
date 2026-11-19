@@ -1,188 +1,219 @@
--- Hud.client.luau
--- Brainrot Bazaar: the heads-up display. A top-centre money panel
--- (kept clear of Roblox's own top-left menu buttons), a stored-cash
--- panel, the tsunami countdown, toast messages, and the action
--- buttons: Panen (collect), Kunci (lock), Gacha, and a two-tap
--- Rebirth button that must be armed before it fires.
+-- Hud: the Brainrot Bazaar HUD. Cash / income / stored panel (top-right, clear of
+-- Roblox's top-left menu buttons), tsunami countdown, toasts, and the two-tap
+-- rebirth button. Buy/collect/lock/gacha all work by clicking the world parts.
 
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
 local player = Players.LocalPlayer
-local remotes = ReplicatedStorage:WaitForChild("BB_Remotes")
-local stateRemote = remotes:WaitForChild("State")
-local toastRemote = remotes:WaitForChild("Toast")
-local actionRemote = remotes:WaitForChild("Action")
+local remotes = ReplicatedStorage:WaitForChild("Remotes")
+local stateEvent = remotes:WaitForChild("StateUpdate")
+local toastEvent = remotes:WaitForChild("Toast")
+local tsunamiEvent = remotes:WaitForChild("TsunamiWarning")
 
 local gui = Instance.new("ScreenGui")
-gui.Name = "BrainrotHud"
+gui.Name = "BazaarHud"
 gui.ResetOnSpawn = false
 gui.Parent = player:WaitForChild("PlayerGui")
 
-local function makeLabel(parent, name, size, pos, text, color, textSize)
-	local label = Instance.new("TextLabel")
-	label.Name = name
-	label.Size = size
-	label.Position = pos
-	label.BackgroundColor3 = Color3.fromRGB(20, 22, 30)
-	label.BackgroundTransparency = 0.25
-	label.TextColor3 = color or Color3.fromRGB(255, 255, 255)
-	label.Font = Enum.Font.FredokaOne
-	label.TextSize = textSize or 20
-	label.Text = text
-	label.Parent = parent
-	return label
+local function money(n)
+	n = math.floor(n + 0.5)
+	local s = tostring(n)
+	local out = ""
+	while #s > 3 do
+		out = "," .. string.sub(s, -3) .. out
+		s = string.sub(s, 1, -4)
+	end
+	return "$" .. s .. out
 end
 
-local function makeButton(parent, name, size, pos, text, bg)
-	local button = Instance.new("TextButton")
-	button.Name = name
-	button.Size = size
-	button.Position = pos
-	button.BackgroundColor3 = bg
-	button.TextColor3 = Color3.fromRGB(255, 255, 255)
-	button.Font = Enum.Font.FredokaOne
-	button.TextSize = 18
-	button.Text = text
-	button.AutoButtonColor = true
-	button.Parent = parent
-	local corner = Instance.new("UICorner")
-	corner.CornerRadius = UDim.new(0, 10)
-	corner.Parent = button
-	return button
-end
-
--- Top-centre panel: cash, income, stored, multiplier.
+-- Top-right money panel.
 local panel = Instance.new("Frame")
 panel.Name = "MoneyPanel"
-panel.Size = UDim2.fromOffset(430, 64)
-panel.Position = UDim2.new(0.5, -215, 0, 12)
-panel.BackgroundColor3 = Color3.fromRGB(16, 18, 26)
+panel.Size = UDim2.fromOffset(260, 150)
+panel.Position = UDim2.new(1, -276, 0, 16)
+panel.BackgroundColor3 = Color3.fromRGB(20, 20, 30)
 panel.BackgroundTransparency = 0.2
+panel.BorderSizePixel = 0
 panel.Parent = gui
-local panelCorner = Instance.new("UICorner")
-panelCorner.CornerRadius = UDim.new(0, 12)
-panelCorner.Parent = panel
+local corner = Instance.new("UICorner")
+corner.CornerRadius = UDim.new(0, 12)
+corner.Parent = panel
 
-local cashLabel = makeLabel(panel, "Cash", UDim2.fromOffset(200, 30), UDim2.fromOffset(10, 4), "$0", Color3.fromRGB(120, 255, 140), 24)
-cashLabel.BackgroundTransparency = 1
-cashLabel.TextXAlignment = Enum.TextXAlignment.Left
-local incomeLabel = makeLabel(panel, "Income", UDim2.fromOffset(200, 26), UDim2.fromOffset(10, 34), "+$0/s", Color3.fromRGB(170, 230, 255), 17)
-incomeLabel.BackgroundTransparency = 1
-incomeLabel.TextXAlignment = Enum.TextXAlignment.Left
-local storedLabel = makeLabel(panel, "Stored", UDim2.fromOffset(200, 30), UDim2.fromOffset(220, 4), "Tersimpan: $0", Color3.fromRGB(255, 220, 120), 19)
-storedLabel.BackgroundTransparency = 1
-storedLabel.TextXAlignment = Enum.TextXAlignment.Left
-local multLabel = makeLabel(panel, "Mult", UDim2.fromOffset(200, 26), UDim2.fromOffset(220, 34), "x1.00", Color3.fromRGB(255, 170, 230), 17)
-multLabel.BackgroundTransparency = 1
-multLabel.TextXAlignment = Enum.TextXAlignment.Left
+local function makeLabel(name, y, size, color)
+	local l = Instance.new("TextLabel")
+	l.Name = name
+	l.Size = UDim2.new(1, -20, 0, size)
+	l.Position = UDim2.new(0, 10, 0, y)
+	l.BackgroundTransparency = 1
+	l.TextColor3 = color
+	l.Font = Enum.Font.FredokaOne
+	l.TextSize = 20
+	l.TextXAlignment = Enum.TextXAlignment.Left
+	l.Parent = panel
+	return l
+end
 
-local tsunamiLabel = makeLabel(gui, "Tsunami", UDim2.fromOffset(300, 34), UDim2.new(0.5, -150, 0, 84), "Tsunami: 180s", Color3.fromRGB(140, 220, 255), 19)
-local toastLabel = makeLabel(gui, "Toast", UDim2.fromOffset(560, 40), UDim2.new(0.5, -280, 0, 124), "", Color3.fromRGB(255, 255, 160), 21)
-toastLabel.BackgroundTransparency = 1
+local cashLabel = makeLabel("Cash", 8, 28, Color3.fromRGB(120, 255, 120))
+local incomeLabel = makeLabel("Income", 40, 24, Color3.fromRGB(255, 220, 90))
+local storedLabel = makeLabel("Stored", 68, 24, Color3.fromRGB(140, 220, 255))
+local rebirthLabel = makeLabel("Rebirth", 96, 24, Color3.fromRGB(255, 140, 220))
+local lockLabel = makeLabel("Lock", 122, 22, Color3.fromRGB(255, 120, 120))
+cashLabel.Text = "Uang: $150"
+incomeLabel.Text = "Income: $0/dtk"
+storedLabel.Text = "Tersimpan: $0"
+rebirthLabel.Text = "Rebirth: 0 (x1.00)"
+lockLabel.Text = ""
 
--- Bottom action bar.
-local bar = Instance.new("Frame")
-bar.Name = "ActionBar"
-bar.Size = UDim2.fromOffset(560, 58)
-bar.Position = UDim2.new(0.5, -280, 1, -72)
-bar.BackgroundTransparency = 1
-bar.Parent = gui
+-- Tsunami countdown banner (top centre).
+local tsunami = Instance.new("TextLabel")
+tsunami.Name = "TsunamiBanner"
+tsunami.Size = UDim2.fromOffset(420, 54)
+tsunami.Position = UDim2.new(0.5, -210, 0, 16)
+tsunami.BackgroundColor3 = Color3.fromRGB(180, 30, 30)
+tsunami.BackgroundTransparency = 0.15
+tsunami.TextColor3 = Color3.fromRGB(255, 255, 255)
+tsunami.Font = Enum.Font.FredokaOne
+tsunami.TextSize = 24
+tsunami.Text = ""
+tsunami.Visible = false
+tsunami.Parent = gui
+local tsunamiCorner = Instance.new("UICorner")
+tsunamiCorner.CornerRadius = UDim.new(0, 12)
+tsunamiCorner.Parent = tsunami
 
-local collectButton = makeButton(bar, "Collect", UDim2.fromOffset(130, 52), UDim2.fromOffset(0, 3), "PANEN $0", Color3.fromRGB(38, 180, 80))
-local lockButton = makeButton(bar, "Lock", UDim2.fromOffset(130, 52), UDim2.fromOffset(142, 3), "KUNCI BASE", Color3.fromRGB(220, 70, 70))
-local gachaButton = makeButton(bar, "Gacha", UDim2.fromOffset(130, 52), UDim2.fromOffset(284, 3), "GACHA $750", Color3.fromRGB(190, 60, 160))
-local rebirthButton = makeButton(bar, "Rebirth", UDim2.fromOffset(142, 52), UDim2.fromOffset(426, 3), "REBIRTH", Color3.fromRGB(240, 160, 40))
+-- Toasts (bottom centre, stacked).
+local toastBox = Instance.new("Frame")
+toastBox.Name = "Toasts"
+toastBox.Size = UDim2.fromOffset(520, 120)
+toastBox.Position = UDim2.new(0.5, -260, 1, -140)
+toastBox.BackgroundTransparency = 1
+toastBox.Parent = gui
+local toastLayout = Instance.new("UIListLayout")
+toastLayout.FillDirection = Enum.FillDirection.Vertical
+toastLayout.HorizontalAlignment = Enum.HorizontalAlignment.Center
+toastLayout.Padding = UDim.new(0, 6)
+toastLayout.Parent = toastBox
 
-collectButton.MouseButton1Click:Connect(function()
-	actionRemote:FireServer("collect")
-end)
-lockButton.MouseButton1Click:Connect(function()
-	actionRemote:FireServer("lock")
-end)
-gachaButton.MouseButton1Click:Connect(function()
-	actionRemote:FireServer("gacha")
-end)
-
--- Two-tap rebirth: first tap arms for 3 seconds, second tap fires.
-local rebirthArmed = false
-local rebirthCostNow = 0
-rebirthButton.MouseButton1Click:Connect(function()
-	if not rebirthArmed then
-		rebirthArmed = true
-		rebirthButton.Text = "YAKIN? $" .. rebirthCostNow
-		rebirthButton.BackgroundColor3 = Color3.fromRGB(255, 60, 60)
-		task.delay(3, function()
-			rebirthArmed = false
-			rebirthButton.Text = "REBIRTH $" .. rebirthCostNow
-			rebirthButton.BackgroundColor3 = Color3.fromRGB(240, 160, 40)
-		end)
-	else
-		rebirthArmed = false
-		actionRemote:FireServer("rebirth")
-		rebirthButton.BackgroundColor3 = Color3.fromRGB(240, 160, 40)
-	end
-end)
-
-local toastToken = 0
 local function showToast(text)
-	toastToken += 1
-	local myToken = toastToken
-	toastLabel.Text = text
-	toastLabel.TextTransparency = 0
-	task.delay(3.2, function()
-		if toastToken == myToken then
-			toastLabel.Text = ""
-		end
+	local t = Instance.new("TextLabel")
+	t.Size = UDim2.fromOffset(500, 34)
+	t.BackgroundColor3 = Color3.fromRGB(20, 20, 30)
+	t.BackgroundTransparency = 0.15
+	t.TextColor3 = Color3.fromRGB(255, 255, 255)
+	t.Font = Enum.Font.FredokaOne
+	t.TextSize = 18
+	t.Text = text
+	t.Parent = toastBox
+	local c = Instance.new("UICorner")
+	c.CornerRadius = UDim.new(0, 8)
+	c.Parent = t
+	task.delay(5, function()
+		t:Destroy()
 	end)
 end
 
-toastRemote.OnClientEvent:Connect(showToast)
+-- Bottom-right buttons: rebirth (two-tap) and collection index.
+local rebirthBtn = Instance.new("TextButton")
+rebirthBtn.Name = "RebirthButton"
+rebirthBtn.Size = UDim2.fromOffset(220, 52)
+rebirthBtn.Position = UDim2.new(1, -236, 1, -140)
+rebirthBtn.BackgroundColor3 = Color3.fromRGB(200, 60, 160)
+rebirthBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+rebirthBtn.Font = Enum.Font.FredokaOne
+rebirthBtn.TextSize = 19
+rebirthBtn.Text = "REBIRTH"
+rebirthBtn.Parent = gui
+local rbCorner = Instance.new("UICorner")
+rbCorner.CornerRadius = UDim.new(0, 12)
+rbCorner.Parent = rebirthBtn
 
-local lastState = nil
-stateRemote.OnClientEvent:Connect(function(state)
-	lastState = state
-	cashLabel.Text = "$" .. state.Cash
-	incomeLabel.Text = "+$" .. state.IncomePerSecond .. "/s  (" .. state.Occupied .. "/" .. state.PadsMax .. ")"
-	storedLabel.Text = "Tersimpan: $" .. state.Stored
-	multLabel.Text = "x" .. string.format("%.2f", state.Multiplier) .. "  Koleksi " .. state.CollectionCount .. "/" .. state.CollectionTotal
-	collectButton.Text = "PANEN $" .. state.Stored
-	if state.LockedSeconds > 0 then
-		lockButton.Text = "TERKUNCI " .. state.LockedSeconds .. "s"
-	else
-		lockButton.Text = "KUNCI BASE"
-	end
-	gachaButton.Text = "GACHA $" .. state.GachaCost
-	rebirthCostNow = state.RebirthCost
+local indexBtn = Instance.new("TextButton")
+indexBtn.Name = "IndexButton"
+indexBtn.Size = UDim2.fromOffset(220, 52)
+indexBtn.Position = UDim2.new(1, -236, 1, -200)
+indexBtn.BackgroundColor3 = Color3.fromRGB(70, 140, 255)
+indexBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+indexBtn.Font = Enum.Font.FredokaOne
+indexBtn.TextSize = 19
+indexBtn.Text = "BUKU KOLEKSI"
+indexBtn.Parent = gui
+local ixCorner = Instance.new("UICorner")
+ixCorner.CornerRadius = UDim.new(0, 12)
+ixCorner.Parent = indexBtn
+
+-- Two-tap rebirth: first tap arms it for 5 seconds, second tap confirms.
+local rebirthArmed = false
+local rebirthCost = 10000
+local armToken = 0
+rebirthBtn.MouseButton1Click:Connect(function()
 	if not rebirthArmed then
-		rebirthButton.Text = "REBIRTH $" .. state.RebirthCost
-	end
-	if state.TsunamiIn <= 10 then
-		tsunamiLabel.Text = "TSUNAMI " .. state.TsunamiIn .. "s — LARI KE BASE!"
-		tsunamiLabel.TextColor3 = Color3.fromRGB(255, 90, 90)
-	else
-		tsunamiLabel.Text = "Tsunami: " .. state.TsunamiIn .. "s"
-		tsunamiLabel.TextColor3 = Color3.fromRGB(140, 220, 255)
-	end
-end)
-
--- Keyboard shortcuts mirror the buttons: C panen, L kunci, G gacha.
-local UserInputService = game:GetService("UserInputService")
-UserInputService.InputBegan:Connect(function(input, gameProcessed)
-	if gameProcessed then
+		rebirthArmed = true
+		armToken = armToken + 1
+		local token = armToken
+		rebirthBtn.Text = "YAKIN? KLIK LAGI!"
+		rebirthBtn.BackgroundColor3 = Color3.fromRGB(220, 30, 30)
+		task.delay(5, function()
+			-- Only disarm if no newer arm happened in the meantime.
+			if token == armToken then
+				rebirthArmed = false
+				rebirthBtn.Text = "REBIRTH"
+				rebirthBtn.BackgroundColor3 = Color3.fromRGB(200, 60, 160)
+			end
+		end)
 		return
 	end
-	if input.KeyCode == Enum.KeyCode.C then
-		actionRemote:FireServer("collect")
-	elseif input.KeyCode == Enum.KeyCode.L then
-		actionRemote:FireServer("lock")
-	elseif input.KeyCode == Enum.KeyCode.G then
-		actionRemote:FireServer("gacha")
+	rebirthArmed = false
+	armToken = armToken + 1
+	rebirthBtn.Text = "REBIRTH"
+	rebirthBtn.BackgroundColor3 = Color3.fromRGB(200, 60, 160)
+	remotes:WaitForChild("Rebirth"):FireServer()
+end)
+
+-- Open/close the Collection Index (the Index client script owns the panel).
+local indexOpen = false
+indexBtn.MouseButton1Click:Connect(function()
+	indexOpen = not indexOpen
+	local indexGui = player.PlayerGui:FindFirstChild("CollectionIndex")
+	if indexGui then
+		indexGui.Enabled = indexOpen
 	end
 end)
 
--- The last state the server sent, exposed for the collection book's
--- debugging and for any future HUD widget.
-function _G.BrainrotHudLastState()
-	return lastState
-end
+-- Hint bar: how to play.
+local hint = Instance.new("TextLabel")
+hint.Name = "Hint"
+hint.Size = UDim2.fromOffset(560, 30)
+hint.Position = UDim2.new(0.5, -280, 1, -36)
+hint.BackgroundTransparency = 1
+hint.TextColor3 = Color3.fromRGB(255, 255, 255)
+hint.Font = Enum.Font.FredokaOne
+hint.TextSize = 16
+hint.Text = "Klik brainrot di toko untuk beli - Klik pad hijau untuk ambil uang - Lari ke base saat tsunami!"
+hint.Parent = gui
+
+stateEvent.OnClientEvent:Connect(function(state)
+	cashLabel.Text = "Uang: " .. money(state.cash)
+	incomeLabel.Text = "Income: " .. money(state.income) .. "/dtk"
+	storedLabel.Text = "Tersimpan: " .. money(state.stored) .. " (klik pad hijau)"
+	rebirthLabel.Text = "Rebirth: " .. state.rebirths .. " (x" .. string.format("%.2f", state.multiplier) .. ") - berikut: " .. money(state.rebirthCost)
+	rebirthCost = state.rebirthCost
+	if state.locked then
+		lockLabel.Text = "Base TERKUNCI"
+	else
+		lockLabel.Text = "Base terbuka - klik tombol merah untuk kunci"
+	end
+end)
+
+toastEvent.OnClientEvent:Connect(showToast)
+
+tsunamiEvent.OnClientEvent:Connect(function(secs)
+	tsunami.Visible = true
+	tsunami.Text = "TSUNAMI DALAM " .. secs .. " DETIK - LARI KE BASE!"
+	if secs <= 0 then
+		tsunami.Visible = false
+	end
+	task.delay(11, function()
+		tsunami.Visible = false
+	end)
+end)
