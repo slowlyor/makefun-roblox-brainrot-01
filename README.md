@@ -1,62 +1,86 @@
 # Brainrot Bazaar
 
-An entry for make.fun's "Make the best AI Roblox brainrot game" bounty (roblox-brainrot-01):
-a 3D Steal-a-Brainrot-style tycoon built entirely from procedural Luau — no external assets,
-no DataStore, all state in memory.
+A Steal-a-Brainrot-style 3D tycoon for Roblox, built entirely from
+procedural Luau -- no external assets, no uploaded meshes, in-memory
+state only (no DataStore). Indonesian food and household objects come
+alive as collectible brainrots: a blender, a rice cooker, a speaker, a
+fan, satay skewers, a rendang pot, an omelet, a sambal jar, and 16 more.
 
-## The game
+## How it plays
 
-Brainrots walk the conveyor belt of the **TOKO BRAINROT** shop. Buy them and they walk home
-to one of the 6 pads in your base (8 bases ring the plaza), where they earn cash every second.
-Step on the green pad to harvest the stored cash, and slam the lock button to seal your base
-for 60 seconds.
+- **Conveyor belt shop.** Brainrots spawn under the TOKO BRAINROT arch
+  and ride a 140-stud conveyor across the plaza. Walk up and buy one
+  with its prompt; it hops off the belt and walks home to a free pad in
+  your base (8 bases x 6 pads).
+- **Income and harvesting.** Each placed brainrot earns $/s into a
+  stored pool. Stand on your base's green collect pad to bank it.
+- **24 characters, 6 rarities.** Common to Divine, $25 to $4,000,000,
+  income scaling with price. Mutations -- Gold x2 (10%), Diamond x3
+  (4%), Rainbow x5 (1.5%) -- multiply both price and income.
+- **Lock your base.** The lock button (or the HUD) seals your base for
+  60 seconds.
+- **The thief.** A thief NPC periodically stalks the richest brainrot
+  in an UNLOCKED base, walks over and steals it. Locked bases are
+  skipped entirely.
+- **Tsunami.** Every 180 seconds, after a 10-second warning, a wave
+  washes away belt brainrots and kills any player caught outside a
+  base. Placed brainrots stay safe -- the dash home is yours.
+- **Gacha machine.** On the plaza: an escalating price per roll, a
+  weighted-rarity prize that walks to a free pad in your base, and a
+  full refund if your base is full.
+- **Rebirth.** Reset cash and brainrots for a permanent +0.75x income
+  multiplier per rebirth; cost 10,000 x 3^rebirths. The HUD button is
+  two-tap so it never fires by accident.
+- **Buku Koleksi.** The collection index (button or the B key): owned
+  brainrots lit with stats, the rest as "???" silhouettes.
 
-- **24 original brainrots** — Indonesian food and household-object characters (Blender Baper,
-  Rice Cooker Nyanyi, Rendang Raja Daging, Sambal Petir Nusantara and friends) across 6
-  rarities, Common to Divine, from $25 to $4,000,000.
-- **Mutations** — Gold x2, Diamond x3, Rainbow x5, multiplying both price and income.
-- **MESIN GACHA BRAINROT** — a plaza gacha machine with an escalating roll price; the prize
-  walks itself home to a free pad (no charge when the base is full).
-- **A thief NPC** periodically steals the richest brainrot from any unlocked base.
-- **A tsunami every 180 seconds** (10-second warning) washes the belt clean and knocks out
-  anyone caught standing outside a base.
-- **Rebirth** resets cash and brainrots for a permanent +0.75x income multiplier per rebirth,
-  costing 10,000 x 3^rebirths. Starting cash is $100.
-- **Buku Koleksi** — a collection index of all 24 brainrots: owned ones lit with their stats,
-  the rest silhouettes named "???".
-- The world is dressed procedurally: an animated fountain, 4 striped market stalls, the
-  rotating BIANGLALA BRAINROT ferris wheel, the MENARA BRAINROT tower with its beacon, a
-  rainbow arch at spawn, trees, rocks, lamps and big readable signs.
+## The world
 
-## Layout
+A fountain plaza with market stalls and a rainbow arch, a spinning
+ferris wheel (BIANGLALA BRAINROT), a tapering tower (MENARA BRAINROT)
+with a beacon, six rarity billboards along the belt, trees, rocks and
+lamp posts -- every part placed on the ground by WorldBuilder, every
+sign on posts. Divine spawns (and Rainbow gacha prizes) arrive with a
+burst of procedural sparkle parts, because a $4,000,000 rendang god
+should never enter quietly.
 
-- `main.ts` (Node 22, standard library only) hands the game in: it copies `game.rbxl`, `src/`,
-  `screenshots/` and `PLAY.json` to `/output`, leaving out every name that starts with a dot,
-  and writes `/output/dossier.json` with `vendor/makefun-roblox.ts`, the kit's copy, unchanged.
-- `game.rbxl` is the place Rojo builds from `src/` and `default.project.json`.
-- `src/shared/BrainrotData.luau` — the cast, rarity weights and mutation table.
-- `src/server/` — `init.server.luau` (bootstrap, belt shop, tsunami, rebirth), `GameState`
-  (all state in one place), `WorldBuilder` (the procedural world), `BrainrotFactory`
-  (procedural characters), `MoveService` (XZ steering with pinned height), `Thief`,
-  `GachaService`.
-- `src/client/` — `Hud.client.luau` (cash/income/stored panel, tsunami countdown, toasts,
-  two-tap rebirth) and `Index.client.luau` (the Buku Koleksi).
-- `PLAY.json` names the published public place; one of the screenshots is also the game's
-  first thumbnail on Roblox.
+Controls in one line: walk with the usual Roblox controls, use the
+prompts on belt brainrots, pads and buttons, tap the HUD buttons for
+gacha / lock / collect / rebirth, and press B for the collection book.
 
-Run it as the grader does, writing `out/` in place of `/output`:
+## Layout of the code
 
-    mkdir -p out && MAKEFUN_OUTPUT_DIR=out node main.ts
+- `src/shared/BrainrotData.luau` -- the cast, rarities, mutations and
+  money formatting; the one source of truth for server and client.
+- `src/server/GameState.luau` -- all mutable state: players, pads,
+  locks, rebirth math, gacha pricing, client snapshots.
+- `src/server/WorldBuilder.luau` -- the whole map, built from the
+  layout constants in its LAYOUT table.
+- `src/server/BrainrotFactory.luau` -- procedural character models
+  with nameplates.
+- `src/server/MoveService.luau` -- XZ steering with the pivot Y pinned
+  absolutely from the walker's current surface.
+- `src/server/Thief.luau`, `src/server/GachaService.luau` -- the
+  threat and the machine.
+- `src/server/init.server.luau` -- bootstrap: remotes, economy loops,
+  belt spawner, tsunami clock, client actions.
+- `src/client/Hud.client.luau` -- cash/income/stored panel, tsunami
+  countdown, toasts, gacha/lock/collect/rebirth buttons.
+- `src/client/Index.client.luau` -- the Buku Koleksi book.
 
-Build the place from source with Rojo 7.7:
+## Build with Rojo
 
     rojo build default.project.json --output game.rbxl
 
-## How to play
+`default.project.json` maps `src/shared` to ReplicatedStorage,
+`src/server` to ServerScriptService and `src/client` to
+StarterPlayerScripts. Then publish `game.rbxl` over the experience
+named in PLAY.json from Roblox Studio.
 
-1. Walk to the **TOKO BRAINROT** belt and press the buy prompt on a brainrot you can afford —
-   it walks to a free pad in your base by itself.
-2. Watch the pad's stored cash grow, then step on the green pad to harvest it.
-3. Roll the **MESIN GACHA BRAINROT** in the plaza when you feel lucky; lock your base before
-   the thief comes calling, and get inside any base when the tsunami warning sounds.
-4. Rebirth from the HUD button once you can afford it: the multiplier is forever.
+## Hand in (make.fun)
+
+    mkdir -p out && MAKEFUN_OUTPUT_DIR=out node main.ts
+
+`main.ts` copies game.rbxl, src/, screenshots/ and PLAY.json to the
+output directory and writes dossier.json with the vendored library in
+vendor/ (the kit's copy, unchanged).

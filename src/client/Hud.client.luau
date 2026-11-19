@@ -1,192 +1,170 @@
 -- Hud.client.luau
--- The Brainrot Bazaar HUD: a top panel with cash, income per second, stored
--- cash waiting on the collect pad, rebirth count and multiplier; a tsunami
--- countdown chip; toast messages; and the two-tap rebirth button (first tap
--- arms it, second tap confirms) plus a gacha price hint.
+-- The Brainrot Bazaar HUD: a cash / income / stored panel (kept clear of
+-- the top-left corner, where Roblox's own menu buttons sit), a tsunami
+-- countdown that turns into a red warning, a toast line, a gacha button
+-- and the two-tap rebirth button (first tap arms it, second confirms --
+-- rebirth wipes your base, so it must never fire on a stray click).
+--
+-- The HUD only displays state and sends intents; every number it shows
+-- came from a server snapshot and every action is re-checked server-side.
 
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
-local player = Players.LocalPlayer
+local BrainrotData = require(ReplicatedStorage:WaitForChild("Shared"):WaitForChild("BrainrotData"))
 local remotes = ReplicatedStorage:WaitForChild("BrainrotRemotes")
-local toastEvent = remotes:WaitForChild("Toast")
-local stateEvent = remotes:WaitForChild("StateUpdate")
-local rebirthEvent = remotes:WaitForChild("RebirthRequest")
-local tsunamiValue = ReplicatedStorage:WaitForChild("TsunamiIn")
+local actionRemote = remotes:WaitForChild("Action")
+local stateRemote = remotes:WaitForChild("State")
+local toastRemote = remotes:WaitForChild("Toast")
 
-local Shared = ReplicatedStorage:WaitForChild("Shared")
-local BrainrotData = require(Shared:WaitForChild("BrainrotData"))
+local player = Players.LocalPlayer
+local playerGui = player:WaitForChild("PlayerGui")
 
 local gui = Instance.new("ScreenGui")
 gui.Name = "BrainrotHud"
 gui.ResetOnSpawn = false
-gui.Parent = player:WaitForChild("PlayerGui")
+gui.Parent = playerGui
 
-local function makeLabel(name, parent, position, size, textSize, color, align)
-	local label = Instance.new("TextLabel")
-	label.Name = name
-	label.Position = position
-	label.Size = size
-	label.BackgroundTransparency = 1
-	label.TextScaled = false
-	label.TextSize = textSize
-	label.Font = Enum.Font.FredokaOne
-	label.TextColor3 = color
-	label.TextXAlignment = align or Enum.TextXAlignment.Left
-	label.TextStrokeTransparency = 0.6
-	label.Parent = parent
-	return label
+local function label(parent: Instance, name: string, pos: UDim2, size: UDim2, text: string, color: Color3, textSize: number): TextLabel
+	local l = Instance.new("TextLabel")
+	l.Name = name
+	l.Position = pos
+	l.Size = size
+	l.BackgroundTransparency = 1
+	l.Font = Enum.Font.FredokaOne
+	l.TextSize = textSize
+	l.TextColor3 = color
+	l.TextStrokeTransparency = 0.4
+	l.Text = text
+	l.Parent = parent
+	return l
 end
 
--- Top stats panel, kept clear of the top-left corner where Roblox puts its
--- own menu buttons: the panel starts a little down and centred-left.
-local panel = Instance.new("Frame")
-panel.Name = "StatsPanel"
-panel.Position = UDim2.new(0, 90, 0, 14)
-panel.Size = UDim2.fromOffset(330, 118)
-panel.BackgroundColor3 = Color3.fromRGB(35, 32, 55)
-panel.BackgroundTransparency = 0.12
-panel.BorderSizePixel = 0
-panel.Parent = gui
-local panelCorner = Instance.new("UICorner")
-panelCorner.CornerRadius = UDim.new(0, 12)
-panelCorner.Parent = panel
-
-local cashLabel = makeLabel("Cash", panel, UDim2.new(0, 14, 0, 6), UDim2.new(1, -28, 0, 34), 26,
-	Color3.fromRGB(140, 255, 150))
-cashLabel.Text = "$100"
-local incomeLabel = makeLabel("Income", panel, UDim2.new(0, 14, 0, 44), UDim2.new(1, -28, 0, 24), 17,
-	Color3.fromRGB(255, 235, 160))
-incomeLabel.Text = "Penghasilan: $0/dtk"
-local storedLabel = makeLabel("Stored", panel, UDim2.new(0, 14, 0, 68), UDim2.new(1, -28, 0, 24), 17,
-	Color3.fromRGB(140, 220, 255))
-storedLabel.Text = "Di pad panen: $0"
-local rebirthLabel = makeLabel("RebirthInfo", panel, UDim2.new(0, 14, 0, 92), UDim2.new(1, -28, 0, 22), 15,
-	Color3.fromRGB(255, 170, 230))
-rebirthLabel.Text = "Rebirth: 0  Pengali: x1.00"
-
--- Tsunami countdown chip, top centre.
-local tsunamiChip = Instance.new("Frame")
-tsunamiChip.Name = "TsunamiChip"
-tsunamiChip.AnchorPoint = Vector2.new(0.5, 0)
-tsunamiChip.Position = UDim2.new(0.5, 0, 0, 14)
-tsunamiChip.Size = UDim2.fromOffset(250, 44)
-tsunamiChip.BackgroundColor3 = Color3.fromRGB(30, 90, 160)
-tsunamiChip.BackgroundTransparency = 0.1
-tsunamiChip.BorderSizePixel = 0
-tsunamiChip.Parent = gui
-local tsunamiCorner = Instance.new("UICorner")
-tsunamiCorner.CornerRadius = UDim.new(0, 12)
-tsunamiCorner.Parent = tsunamiChip
-local tsunamiLabel = makeLabel("TsunamiText", tsunamiChip, UDim2.fromScale(0, 0), UDim2.fromScale(1, 1), 20,
-	Color3.fromRGB(255, 255, 255), Enum.TextXAlignment.Center)
-tsunamiLabel.Text = "Tsunami: 180 dtk"
-
-local function refreshTsunami()
-	local seconds = math.max(0, math.floor(tsunamiValue.Value))
-	tsunamiLabel.Text = "Tsunami: " .. seconds .. " dtk"
-	if seconds <= 10 then
-		tsunamiChip.BackgroundColor3 = Color3.fromRGB(200, 45, 45)
-		tsunamiLabel.Text = "TSUNAMI " .. seconds .. " DTK! MASUK BASE!"
-	else
-		tsunamiChip.BackgroundColor3 = Color3.fromRGB(30, 90, 160)
-	end
-end
-tsunamiValue.Changed:Connect(refreshTsunami)
-refreshTsunami()
-
--- Toast stack, bottom centre: newest on top, each fades after 4 seconds.
-local toastFrame = Instance.new("Frame")
-toastFrame.Name = "Toasts"
-toastFrame.AnchorPoint = Vector2.new(0.5, 1)
-toastFrame.Position = UDim2.new(0.5, 0, 1, -110)
-toastFrame.Size = UDim2.fromOffset(560, 160)
-toastFrame.BackgroundTransparency = 1
-toastFrame.Parent = gui
-local toastLayout = Instance.new("UIListLayout")
-toastLayout.VerticalAlignment = Enum.VerticalAlignment.Bottom
-toastLayout.Padding = UDim.new(0, 6)
-toastLayout.Parent = toastFrame
-
-local function showToast(message)
-	local label = Instance.new("TextLabel")
-	label.Name = "Toast"
-	label.Size = UDim2.new(1, 0, 0, 36)
-	label.BackgroundColor3 = Color3.fromRGB(30, 28, 45)
-	label.BackgroundTransparency = 0.15
-	label.Text = message
-	label.TextSize = 18
-	label.Font = Enum.Font.FredokaOne
-	label.TextColor3 = Color3.fromRGB(255, 255, 255)
-	label.TextWrapped = true
-	label.Parent = toastFrame
+local function panel(parent: Instance, name: string, pos: UDim2, size: UDim2, color: Color3): Frame
+	local f = Instance.new("Frame")
+	f.Name = name
+	f.Position = pos
+	f.Size = size
+	f.BackgroundColor3 = color
+	f.BackgroundTransparency = 0.25
+	f.BorderSizePixel = 0
 	local corner = Instance.new("UICorner")
-	corner.CornerRadius = UDim.new(0, 9)
-	corner.Parent = label
-	task.delay(4, function()
-		label:Destroy()
-	end)
+	corner.CornerRadius = UDim.new(0, 12)
+	corner.Parent = f
+	f.Parent = parent
+	return f
 end
-toastEvent.OnClientEvent:Connect(showToast)
 
--- Rebirth button: two-tap confirm so nobody wipes a base by accident.
-local rebirthButton = Instance.new("TextButton")
-rebirthButton.Name = "RebirthButton"
-rebirthButton.AnchorPoint = Vector2.new(1, 1)
-rebirthButton.Position = UDim2.new(1, -16, 1, -16)
-rebirthButton.Size = UDim2.fromOffset(240, 62)
-rebirthButton.BackgroundColor3 = Color3.fromRGB(170, 60, 220)
-rebirthButton.TextColor3 = Color3.fromRGB(255, 255, 255)
-rebirthButton.TextSize = 19
-rebirthButton.Font = Enum.Font.FredokaOne
-rebirthButton.Text = "REBIRTH"
-rebirthButton.Parent = gui
-local rebirthCorner = Instance.new("UICorner")
-rebirthCorner.CornerRadius = UDim.new(0, 12)
-rebirthCorner.Parent = rebirthButton
+-- Stats panel: top-centre, safely right of the Roblox menu corner.
+local stats = panel(gui, "StatsPanel", UDim2.new(0.5, -190, 0, 12), UDim2.new(0, 380, 0, 86), Color3.fromRGB(30, 32, 45))
+local cashLabel = label(stats, "Cash", UDim2.new(0, 14, 0, 4), UDim2.new(1, -28, 0, 34), "Uang: $150", Color3.fromRGB(120, 255, 140), 26)
+cashLabel.TextXAlignment = Enum.TextXAlignment.Left
+local incomeLabel = label(stats, "Income", UDim2.new(0, 14, 0, 40), UDim2.new(0.5, -14, 0, 22), "Penghasilan: $0/dtk", Color3.fromRGB(255, 230, 130), 16)
+incomeLabel.TextXAlignment = Enum.TextXAlignment.Left
+local storedLabel = label(stats, "Stored", UDim2.new(0.5, 0, 0, 40), UDim2.new(0.5, -14, 0, 22), "Tersimpan: $0", Color3.fromRGB(140, 220, 255), 16)
+storedLabel.TextXAlignment = Enum.TextXAlignment.Left
+local multLabel = label(stats, "Multiplier", UDim2.new(0, 14, 0, 62), UDim2.new(1, -28, 0, 20), "Pengali: x1.00 - Rebirth: 0", Color3.fromRGB(255, 170, 220), 14)
+multLabel.TextXAlignment = Enum.TextXAlignment.Left
 
-local rebirthCost = 10000
+-- Tsunami countdown under the stats panel.
+local tsunamiLabel = label(gui, "Tsunami", UDim2.new(0.5, -150, 0, 106), UDim2.new(0, 300, 0, 28), "Tsunami: 180 dtk", Color3.fromRGB(255, 255, 255), 20)
+
+-- Toast line: server messages (buys, thefts, warnings) land here.
+local toastLabel = label(gui, "Toast", UDim2.new(0.5, -320, 1, -120), UDim2.new(0, 640, 0, 34), "", Color3.fromRGB(255, 255, 160), 22)
+local toastToken = 0
+toastRemote.OnClientEvent:Connect(function(text: string)
+	toastToken += 1
+	local my = toastToken
+	toastLabel.Text = text
+	task.delay(3.5, function()
+		if toastToken == my then
+			toastLabel.Text = ""
+		end
+	end)
+end)
+
+-- Buttons -----------------------------------------------------------------
+local function button(name: string, pos: UDim2, size: UDim2, text: string, color: Color3): TextButton
+	local b = Instance.new("TextButton")
+	b.Name = name
+	b.Position = pos
+	b.Size = size
+	b.BackgroundColor3 = color
+	b.BackgroundTransparency = 0.1
+	b.Font = Enum.Font.FredokaOne
+	b.TextSize = 18
+	b.TextColor3 = Color3.fromRGB(255, 255, 255)
+	b.TextStrokeTransparency = 0.5
+	b.Text = text
+	local corner = Instance.new("UICorner")
+	corner.CornerRadius = UDim.new(0, 12)
+	corner.Parent = b
+	b.Parent = gui
+	return b
+end
+
+local collectButton = button("CollectButton", UDim2.new(1, -190, 1, -170), UDim2.new(0, 176, 0, 52), "PANEN UANG", Color3.fromRGB(46, 180, 100))
+collectButton.Activated:Connect(function()
+	actionRemote:FireServer("collect")
+end)
+
+local gachaButton = button("GachaButton", UDim2.new(1, -190, 1, -108), UDim2.new(0, 176, 0, 52), "GACHA $500", Color3.fromRGB(230, 80, 140))
+gachaButton.Activated:Connect(function()
+	actionRemote:FireServer("gacha")
+end)
+
+local lockButton = button("LockButton", UDim2.new(0, 14, 1, -108), UDim2.new(0, 176, 0, 52), "KUNCI BASE", Color3.fromRGB(90, 120, 220))
+lockButton.Activated:Connect(function()
+	actionRemote:FireServer("lock")
+end)
+
+-- Two-tap rebirth: first tap arms for 3 seconds, second tap confirms.
+local rebirthButton = button("RebirthButton", UDim2.new(0, 14, 1, -170), UDim2.new(0, 176, 0, 52), "REBIRTH", Color3.fromRGB(150, 80, 220))
 local rebirthArmed = false
-rebirthButton.MouseButton1Click:Connect(function()
+local rebirthCost = 0
+rebirthButton.Activated:Connect(function()
 	if not rebirthArmed then
 		rebirthArmed = true
 		rebirthButton.Text = "YAKIN? KETUK LAGI!"
-		rebirthButton.BackgroundColor3 = Color3.fromRGB(230, 60, 60)
+		rebirthButton.BackgroundColor3 = Color3.fromRGB(231, 76, 60)
 		task.delay(3, function()
 			rebirthArmed = false
-			rebirthButton.Text = "REBIRTH " .. BrainrotData.FormatMoney(rebirthCost)
-			rebirthButton.BackgroundColor3 = Color3.fromRGB(170, 60, 220)
+			rebirthButton.Text = "REBIRTH " .. BrainrotData.formatMoney(rebirthCost)
+			rebirthButton.BackgroundColor3 = Color3.fromRGB(150, 80, 220)
 		end)
 	else
 		rebirthArmed = false
-		rebirthEvent:FireServer()
-		rebirthButton.Text = "REBIRTH " .. BrainrotData.FormatMoney(rebirthCost)
-		rebirthButton.BackgroundColor3 = Color3.fromRGB(170, 60, 220)
+		actionRemote:FireServer("rebirth")
+		rebirthButton.BackgroundColor3 = Color3.fromRGB(150, 80, 220)
 	end
 end)
 
--- Gacha price hint under the rebirth button.
-local gachaHint = makeLabel("GachaHint", gui, UDim2.new(1, -256, 1, -108), UDim2.fromOffset(240, 24), 15,
-	Color3.fromRGB(255, 190, 235), Enum.TextXAlignment.Right)
-gachaHint.Text = "Gacha di plaza: $250"
+-- A small "how to play" strip at the bottom centre, so a first-time
+-- player learns the loop from the screen itself: buy on the belt, the
+-- brainrot walks home, stand on the green pad to harvest.
+label(gui, "HowTo", UDim2.new(0.5, -330, 1, -34), UDim2.new(0, 660, 0, 22), "Beli brainrot di conveyor - dia jalan ke base-mu - injak pad hijau untuk panen!", Color3.fromRGB(255, 255, 255), 15)
 
--- Server state pushes drive every number on the panel.
-stateEvent.OnClientEvent:Connect(function(state)
-	cashLabel.Text = BrainrotData.FormatMoney(state.Cash)
-	incomeLabel.Text = "Penghasilan: " .. BrainrotData.FormatMoney(state.Income) .. "/dtk"
-	storedLabel.Text = "Di pad panen: " .. BrainrotData.FormatMoney(state.Stored)
-	rebirthLabel.Text = string.format("Rebirth: %d  Pengali: x%.2f  Base #%d%s",
-		state.Rebirths, state.Multiplier, state.BaseIndex, state.Locked and "  TERKUNCI" or "")
-	rebirthCost = state.RebirthCost
+-- State snapshots ---------------------------------------------------------
+stateRemote.OnClientEvent:Connect(function(snap)
+	cashLabel.Text = "Uang: " .. BrainrotData.formatMoney(snap.cash)
+	incomeLabel.Text = "Penghasilan: " .. BrainrotData.formatMoney(snap.income) .. "/dtk"
+	storedLabel.Text = "Tersimpan: " .. BrainrotData.formatMoney(snap.stored)
+	multLabel.Text = string.format("Pengali: x%.2f - Rebirth: %d - Base %d", snap.multiplier, snap.rebirths, snap.plotIndex)
+	gachaButton.Text = "GACHA " .. BrainrotData.formatMoney(snap.gachaCost)
+	rebirthCost = snap.rebirthCost
 	if not rebirthArmed then
-		rebirthButton.Text = "REBIRTH " .. BrainrotData.FormatMoney(state.RebirthCost)
+		rebirthButton.Text = "REBIRTH " .. BrainrotData.formatMoney(snap.rebirthCost)
 	end
-	gachaHint.Text = "Gacha di plaza: " .. BrainrotData.FormatMoney(state.GachaCost)
+	if snap.lockLeft > 0 then
+		lockButton.Text = "TERKUNCI " .. snap.lockLeft .. " dtk"
+	else
+		lockButton.Text = "KUNCI BASE"
+	end
+	if snap.tsunamiWarning then
+		tsunamiLabel.Text = "TSUNAMI " .. snap.tsunamiIn .. " DTK - LARI KE BASE!"
+		tsunamiLabel.TextColor3 = Color3.fromRGB(255, 80, 80)
+	else
+		tsunamiLabel.Text = "Tsunami: " .. snap.tsunamiIn .. " dtk"
+		tsunamiLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+	end
 end)
-
--- Objective line under the stats panel: always one clear next step.
-local objectiveLabel = makeLabel("Objective", gui, UDim2.new(0, 90, 0, 196), UDim2.fromOffset(420, 24), 15,
-	Color3.fromRGB(255, 255, 255))
-objectiveLabel.Text = "Tujuan: beli brainrot, panen di pad hijau, kunci base!"
-
-showToast("Beli brainrot dari ban berjalan TOKO BRAINROT!")

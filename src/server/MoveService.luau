@@ -1,131 +1,138 @@
 -- MoveService.luau
--- Walks brainrot models (and the thief) along a list of waypoints.
+-- XZ-plane steering for every walking model in Brainrot Bazaar: belt
+-- shoppers, gacha prizes walking home, and the thief.
 --
--- Movement rule that keeps this service safe: steering happens on the XZ
--- plane only, and the model's height is PINNED every step to the current
--- waypoint's absolute Y plus the mover's fixed lift. The model's current Y
--- is never read back into its height, so a model can never ratchet itself
--- upward step by step.
+-- Height rule (the important one): a model's pivot Y is pinned ABSOLUTELY
+-- from its current target -- belt riders ride at BELT_TOP + lift, ground
+-- walkers at 0 + lift. The model's current Y is never read back into its
+-- height, so a walker can step from the belt down to the grass (or the
+-- reverse) without sinking, floating or accumulating drift.
 
 local RunService = game:GetService("RunService")
 
 local MoveService = {}
 
-local movers = {}
-local heartbeatBound = false
+-- World heights the targets are pinned against.
+MoveService.BELT_TOP = 1.3
+MoveService.GROUND_TOP = 0
 
-local BOB_HEIGHT = 0.12
-local BOB_SPEED = 7
+type Walker = {
+	model: Model,
+	lift: number, -- pivot height above the surface it walks on
+	speed: number, -- studs per second
+	queue: { Vector3 }, -- remaining XZ waypoints
+	surfaceY: number, -- absolute Y of the surface under the current leg
+	onArrive: (() -> ())?,
+	face: Vector3?, -- last movement direction, for facing
+}
 
-local function stepMover(mover, dt)
-	local model = mover.Model
-	if not model.Parent then
-		movers[model] = nil
-		return
-	end
-	local target = mover.Targets[mover.Index]
-	if not target then
-		movers[model] = nil
-		if mover.OnArrive then
-			mover.OnArrive()
+local walkers: { [Model]: Walker } = {}
+local heartbeatConn: RBXScriptConnection? = nil
+
+-- The vertical offset of a model's pivot above the surface it stands on.
+-- Models are built standing on Y=0 with the pivot at their base, so the
+-- lift is simply how tall the builder left the pivot; we measure it once
+-- at build time from the model's bounding box base.
+local function measureLift(model: Model): number
+	local cf, _size = model:GetBoundingBox()
+	-- The factory builds every character with its pivot at half height.
+	return math.max(0.5, cf.Position.Y)
+end
+
+-- Register a model to walk through `waypoints` (Vector3s; only X/Z are
+-- used). `surfaceY` is the absolute height of the surface it walks on for
+-- the whole route. onArrive fires once when the last waypoint is reached.
+function MoveService.walk(model: Model, waypoints: { Vector3 }, speed: number, surfaceY: number, onArrive: (() -> ())?)
+	if #waypoints == 0 then
+		if onArrive then
+			onArrive()
 		end
 		return
 	end
+	walkers[model] = {
+		model = model,
+		lift = measureLift(model),
+		speed = speed,
+		queue = table.clone(waypoints),
+		surfaceY = surfaceY,
+		onArrive = onArrive,
+		face = nil,
+	}
+	MoveService.ensureLoop()
+end
 
-	-- Absolute pinned height for this leg: waypoint Y + fixed lift + bob.
-	local bob = math.sin(os.clock() * BOB_SPEED + mover.Phase) * BOB_HEIGHT
-	local pinnedY = target.Y + mover.Lift + bob
+-- Stop a model where it stands (used when a belt walker is bought: the
+-- purchase code immediately re-registers it toward its new home pad).
+function MoveService.stop(model: Model)
+	walkers[model] = nil
+end
 
-	local pivot = model:GetPivot()
-	local dx = target.X - pivot.Position.X
-	local dz = target.Z - pivot.Position.Z
-	local dist = math.sqrt(dx * dx + dz * dz)
-	local step = mover.Speed * dt
+function MoveService.isWalking(model: Model): boolean
+	return walkers[model] ~= nil
+end
 
-	if dist <= math.max(step, 0.15) then
-		-- Arrive on this waypoint: snap XZ exactly, keep the pinned height.
-		model:PivotTo(CFrame.new(target.X, pinnedY, target.Z))
-		mover.Index += 1
-		if mover.Index > #mover.Targets then
-			movers[model] = nil
-			if mover.OnArrive then
-				mover.OnArrive()
+local function step(dt: number)
+	for model, w in pairs(walkers) do
+		if not model.Parent then
+			walkers[model] = nil
+		else
+			local target = w.queue[1]
+			local pos = model:GetPivot().Position
+			local dx = target.X - pos.X
+			local dz = target.Z - pos.Z
+			local dist = math.sqrt(dx * dx + dz * dz)
+			local stepLen = w.speed * dt
+			local nx, nz = pos.X, pos.Z
+			if dist <= stepLen or dist < 0.05 then
+				nx, nz = target.X, target.Z
+				table.remove(w.queue, 1)
+			else
+				nx = pos.X + dx / dist * stepLen
+				nz = pos.Z + dz / dist * stepLen
+				w.face = Vector3.new(dx, 0, dz)
+			end
+			-- Pin Y from the target surface, never from the current Y.
+			local pinnedY = w.surfaceY + w.lift
+			local facing = w.face or Vector3.new(1, 0, 0)
+			local look = CFrame.lookAt(Vector3.new(nx, pinnedY, nz), Vector3.new(nx + facing.X, pinnedY, nz + facing.Z))
+			model:PivotTo(look)
+			if #w.queue == 0 then
+				local cb = w.onArrive
+				walkers[model] = nil
+				if cb then
+					cb()
+				end
 			end
 		end
+	end
+end
+
+-- Teleport a model onto a surface, still honouring the pinning rule: the
+-- caller names the surface height, the lift does the rest. Used when a
+-- bought brainrot is placed on its pad and when walkers first spawn.
+function MoveService.placeOn(model: Model, x: number, z: number, surfaceY: number, faceX: number?, faceZ: number?)
+	local lift = measureLift(model)
+	local fx = faceX or 0
+	local fz = faceZ or 1
+	local at = Vector3.new(x, surfaceY + lift, z)
+	model:PivotTo(CFrame.lookAt(at, at + Vector3.new(fx, 0, fz)))
+end
+
+-- How many models are currently walking; the spawner uses it to cap the
+-- belt so a busy server never floods the map with shoppers.
+function MoveService.activeCount(): number
+	local n = 0
+	for _ in pairs(walkers) do
+		n += 1
+	end
+	return n
+end
+
+function MoveService.ensureLoop()
+	if heartbeatConn then
 		return
 	end
-
-	local nx = pivot.Position.X + dx / dist * step
-	local nz = pivot.Position.Z + dz / dist * step
-	-- Face the walk direction while moving.
-	local facing = CFrame.lookAt(Vector3.new(nx, pinnedY, nz), Vector3.new(target.X, pinnedY, target.Z))
-	model:PivotTo(facing)
-end
-
-local function ensureHeartbeat()
-	if heartbeatBound then
-		return
-	end
-	heartbeatBound = true
-	RunService.Heartbeat:Connect(function(dt)
-		for _, mover in pairs(movers) do
-			stepMover(mover, dt)
-		end
-	end)
-end
-
--- Walk a model through waypoints (Vector3 list) at speed studs/second.
--- lift is the fixed height above each waypoint's Y the pivot rides at.
--- onArrive fires once, when the last waypoint is reached.
-function MoveService.Walk(model, waypoints, speed, lift, onArrive)
-	ensureHeartbeat()
-	movers[model] = {
-		Model = model,
-		Targets = waypoints,
-		Index = 1,
-		Speed = speed,
-		Lift = lift,
-		Phase = math.random() * math.pi * 2,
-		OnArrive = onArrive,
-	}
-end
-
--- Walk in a straight line to one point.
-function MoveService.WalkTo(model, point, speed, lift, onArrive)
-	MoveService.Walk(model, { point }, speed, lift, onArrive)
-end
-
--- Teleport a model so its pivot sits at an absolute position, facing angle.
-function MoveService.PlaceAt(model, position, facingAngle)
-	local angle = facingAngle or 0
-	model:PivotTo(CFrame.new(position) * CFrame.Angles(0, angle, 0))
-end
-
-function MoveService.Stop(model)
-	movers[model] = nil
-end
-
-function MoveService.IsWalking(model)
-	return movers[model] ~= nil
-end
-
--- Turn a model to face a world point without moving it (XZ plane only, the
--- height stays exactly where the pivot already is).
-function MoveService.FaceToward(model, point)
-	local pivot = model:GetPivot()
-	local flat = Vector3.new(point.X, pivot.Position.Y, point.Z)
-	if (flat - pivot.Position).Magnitude > 0.01 then
-		model:PivotTo(CFrame.lookAt(pivot.Position, flat))
-	end
-end
-
--- How many models are mid-walk right now (debug and tsunami bookkeeping).
-function MoveService.ActiveCount()
-	local count = 0
-	for _ in pairs(movers) do
-		count += 1
-	end
-	return count
+	heartbeatConn = RunService.Heartbeat:Connect(step)
 end
 
 return MoveService

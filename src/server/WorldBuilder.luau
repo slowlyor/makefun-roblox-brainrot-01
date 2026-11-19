@@ -1,17 +1,52 @@
 -- WorldBuilder.luau
--- Builds the whole Brainrot Bazaar world from procedural Parts: ground,
--- central plaza, the TOKO BRAINROT conveyor shop, eight player bases, and
--- the dressing that makes the place read at a glance — fountain, market
--- stalls, the BIANGLALA BRAINROT ferris wheel, MENARA BRAINROT tower,
--- rainbow arch, trees, rocks, lamps and big readable signs.
+-- Builds the whole Brainrot Bazaar map out of procedural Parts, exactly to
+-- the layout spec: ground top surface is Y=0 and EVERY part sits ON the
+-- ground (its base at Y=0 or on the slab/belt it belongs to), never below.
+-- Signs stand on posts with the board centre at the stated height.
+--
+-- Returns a refs table the other server systems use: plot pad positions,
+-- collect pads, lock buttons, the belt folder, the gacha machine, the
+-- fountain water and the ferris wheel (with a RotateWheel driver).
 
 local WorldBuilder = {}
 
-local function part(parent, name, size, cframe, color, material)
+-- Layout constants, exported so tooling (and humans) can sanity-print the
+-- intended position and base height of every landmark.
+WorldBuilder.LAYOUT = {
+	Fountain = { x = 0, z = 44, baseY = 0 },
+	WheelHub = { x = -128, z = -52, baseY = 26 },
+	Tower = { x = 128, z = -52, baseY = 0 },
+	RainbowArch = { x = 0, z = 58, baseY = 0 },
+	BeltWestEnd = { x = -70, z = 0, baseY = 0 },
+	BeltEastEnd = { x = 70, z = 0, baseY = 0 },
+	SpawnPad = { x = 0, z = 26, baseY = 0 },
+	Gacha = { x = -18, z = 44, baseY = 0 },
+	PlotCenters = {
+		{ x = -102, z = -84, baseY = 0 }, { x = -34, z = -84, baseY = 0 },
+		{ x = 34, z = -84, baseY = 0 }, { x = 102, z = -84, baseY = 0 },
+		{ x = -102, z = 84, baseY = 0 }, { x = -34, z = 84, baseY = 0 },
+		{ x = 34, z = 84, baseY = 0 }, { x = 102, z = 84, baseY = 0 },
+	},
+}
+
+local BELT_TOP = 1.3
+local PLOT_TOP = 0.25
+local PAD_TOP = 0.45
+
+local function folder(parent: Instance, name: string): Folder
+	local f = Instance.new("Folder")
+	f.Name = name
+	f.Parent = parent
+	return f
+end
+
+-- A box whose BASE sits at baseY: you state footprint, height and base,
+-- never a centre height, so nothing can accidentally sink under Y=0.
+local function box(parent: Instance, name: string, w: number, h: number, d: number, x: number, baseY: number, z: number, color: Color3, material: Enum.Material?): Part
 	local p = Instance.new("Part")
 	p.Name = name
-	p.Size = size
-	p.CFrame = cframe
+	p.Size = Vector3.new(w, h, d)
+	p.CFrame = CFrame.new(x, baseY + h / 2, z)
 	p.Color = color
 	p.Material = material or Enum.Material.SmoothPlastic
 	p.Anchored = true
@@ -21,442 +56,426 @@ local function part(parent, name, size, cframe, color, material)
 	return p
 end
 
--- A free-standing sign: post plus a board with a SurfaceGui text face.
-function WorldBuilder.MakeSign(parent, name, text, position, size, boardColor, textColor, fontSize)
-	local group = Instance.new("Model")
-	group.Name = name
-	group.Parent = parent
-	local post = part(group, "Post", Vector3.new(0.6, size.Y + 3, 0.6),
-		CFrame.new(position.X, (size.Y + 3) / 2, position.Z), Color3.fromRGB(90, 70, 50), Enum.Material.Wood)
-	post.CanCollide = false
-	local board = part(group, "Board", size,
-		CFrame.new(position.X, size.Y + 3 + size.Y / 2 - 1, position.Z), boardColor, Enum.Material.SmoothPlastic)
+-- A flat cylinder (disc) whose TOP is at topY. Cylinder parts lie on
+-- their X axis, so rotate 90 degrees about Z to stand the axis upright.
+local function disc(parent: Instance, name: string, radius: number, thickness: number, x: number, topY: number, z: number, color: Color3, material: Enum.Material?): Part
+	local p = Instance.new("Part")
+	p.Name = name
+	p.Shape = Enum.PartType.Cylinder
+	p.Size = Vector3.new(thickness, radius * 2, radius * 2)
+	p.CFrame = CFrame.new(x, topY - thickness / 2, z) * CFrame.Angles(0, 0, math.rad(90))
+	p.Color = color
+	p.Material = material or Enum.Material.SmoothPlastic
+	p.Anchored = true
+	p.TopSurface = Enum.SurfaceType.Smooth
+	p.BottomSurface = Enum.SurfaceType.Smooth
+	p.Parent = parent
+	return p
+end
+
+-- A sign: two posts from the ground and a board whose CENTRE is at
+-- boardCenterY, with the text on both broad faces.
+local function sign(parent: Instance, x: number, z: number, boardCenterY: number, w: number, h: number, text: string, boardColor: Color3, textColor: Color3)
+	local g = folder(parent, "Sign")
+	local postColor = Color3.fromRGB(120, 85, 50)
+	box(g, "PostL", 0.5, boardCenterY, 0.5, x - w / 2 + 0.6, 0, z, postColor, Enum.Material.Wood)
+	box(g, "PostR", 0.5, boardCenterY, 0.5, x + w / 2 - 0.6, 0, z, postColor, Enum.Material.Wood)
+	local board = box(g, "Board", w, h, 0.5, x, boardCenterY - h / 2, z, boardColor, Enum.Material.Wood)
+	for _, face in ipairs({ Enum.NormalId.Front, Enum.NormalId.Back }) do
+		local gui = Instance.new("SurfaceGui")
+		gui.Face = face
+		gui.SizingMode = Enum.SurfaceGuiSizingMode.PixelsPerStud
+		gui.PixelsPerStud = 40
+		local label = Instance.new("TextLabel")
+		label.Size = UDim2.new(1, 0, 1, 0)
+		label.BackgroundTransparency = 1
+		label.Font = Enum.Font.FredokaOne
+		label.TextScaled = true
+		label.TextColor3 = textColor
+		label.Text = text
+		label.Parent = gui
+		gui.Parent = board
+	end
+	return g
+end
+
+local PATH_COLOR = Color3.fromRGB(205, 208, 210)
+
+local function buildGroundAndPaths(root: Folder)
+	-- One big flat part, top at Y=0, X -190..190, Z -150..150.
+	local ground = box(root, "Ground", 380, 2, 300, 0, -2, 0, Color3.fromRGB(86, 199, 76), Enum.Material.Grass)
+	ground.Locked = true
+	-- Plaza disc: radius 34, top Y=0.15, centred (0, 44).
+	disc(root, "Plaza", 34, 0.15, 0, 0.15, 44, Color3.fromRGB(245, 214, 130), Enum.Material.SmoothPlastic)
+	-- Paths (top Y=0.06): plaza to belt, plaza to each plot row, belt to rows.
+	box(root, "PathPlazaBelt", 8, 0.06, 36, 0, 0, 24, PATH_COLOR, Enum.Material.Concrete)
+	box(root, "PathNorthRow", 250, 0.06, 7, 0, 0, 66, PATH_COLOR, Enum.Material.Concrete)
+	box(root, "PathSouthRow", 250, 0.06, 7, 0, 0, -66, PATH_COLOR, Enum.Material.Concrete)
+	box(root, "PathBeltNorth", 250, 0.06, 7, 0, 0, -20, PATH_COLOR, Enum.Material.Concrete)
+	for _, px in ipairs({ -102, -34, 34, 102 }) do
+		box(root, "PathSpur", 6, 0.06, 18, px, 0, 75, PATH_COLOR, Enum.Material.Concrete)
+		box(root, "PathSpur", 6, 0.06, 18, px, 0, -75, PATH_COLOR, Enum.Material.Concrete)
+	end
+end
+
+local function buildBelt(root: Folder)
+	local belt = folder(root, "ConveyorBelt")
+	-- Belt slab along X at Z=0, X -70..70, top surface at Y=1.3.
+	box(belt, "BeltSlab", 140, BELT_TOP, 10, 0, 0, 0, Color3.fromRGB(52, 54, 64), Enum.Material.Metal)
+	-- Moving-look stripes across the belt every 10 studs.
+	for x = -65, 65, 10 do
+		box(belt, "BeltStripe", 1.2, 0.06, 9.6, x, BELT_TOP, 0, Color3.fromRGB(90, 94, 110), Enum.Material.Metal)
+	end
+	-- Side rails.
+	box(belt, "RailNorth", 140, 0.5, 0.4, 0, BELT_TOP, -5, Color3.fromRGB(255, 176, 32), Enum.Material.Metal)
+	box(belt, "RailSouth", 140, 0.5, 0.4, 0, BELT_TOP, 5, Color3.fromRGB(255, 176, 32), Enum.Material.Metal)
+	-- Support legs down to the ground.
+	for x = -66, 66, 12 do
+		box(belt, "BeltLeg", 1, BELT_TOP, 1, x, 0, -4, Color3.fromRGB(40, 42, 50), Enum.Material.Metal)
+		box(belt, "BeltLeg", 1, BELT_TOP, 1, x, 0, 4, Color3.fromRGB(40, 42, 50), Enum.Material.Metal)
+	end
+	-- "TOKO BRAINROT" arch at X=-70: posts at Z=-7 and Z=7 rising to Y=14,
+	-- board across the top centred Y=13, spanning Z -8..8.
+	local arch = folder(belt, "ShopArch")
+	box(arch, "ArchPostA", 1.4, 14, 1.4, -70, 0, -7, Color3.fromRGB(200, 60, 90), Enum.Material.SmoothPlastic)
+	box(arch, "ArchPostB", 1.4, 14, 1.4, -70, 0, 7, Color3.fromRGB(200, 60, 90), Enum.Material.SmoothPlastic)
+	local board = box(arch, "ArchBoard", 2, 3.4, 16, -70, 13 - 1.7, 0, Color3.fromRGB(255, 209, 26), Enum.Material.SmoothPlastic)
 	local gui = Instance.new("SurfaceGui")
-	gui.Face = Enum.NormalId.Front
-	gui.Parent = board
+	gui.Face = Enum.NormalId.Right
+	gui.SizingMode = Enum.SurfaceGuiSizingMode.PixelsPerStud
+	gui.PixelsPerStud = 40
 	local label = Instance.new("TextLabel")
-	label.Size = UDim2.fromScale(1, 1)
+	label.Size = UDim2.new(1, 0, 1, 0)
 	label.BackgroundTransparency = 1
-	label.Text = text
-	label.TextScaled = true
 	label.Font = Enum.Font.FredokaOne
-	label.TextColor3 = textColor or Color3.fromRGB(255, 255, 255)
-	label.Parent = gui
-	local back = gui:Clone()
-	back.Face = Enum.NormalId.Back
-	back.Parent = board
-	return group
-end
-
--- A billboard-style floating sign that always faces the camera.
-local function floatingSign(parent, name, text, position, size, color)
-	local anchor = part(parent, name, Vector3.new(1, 1, 1), CFrame.new(position),
-		Color3.fromRGB(255, 255, 255), Enum.Material.SmoothPlastic)
-	anchor.Transparency = 1
-	anchor.CanCollide = false
-	local gui = Instance.new("BillboardGui")
-	gui.Name = "SignGui"
-	gui.Size = UDim2.fromOffset(size.X, size.Y)
-	gui.AlwaysOnTop = false
-	gui.Adornee = anchor
-	local label = Instance.new("TextLabel")
-	label.Size = UDim2.fromScale(1, 1)
-	label.BackgroundColor3 = Color3.fromRGB(40, 35, 60)
-	label.BackgroundTransparency = 0.15
-	label.Text = text
 	label.TextScaled = true
-	label.Font = Enum.Font.FredokaOne
-	label.TextColor3 = color
+	label.TextColor3 = Color3.fromRGB(120, 30, 60)
+	label.Text = "TOKO BRAINROT"
 	label.Parent = gui
-	gui.Parent = anchor
-	return anchor
+	gui.Parent = board
+	return belt
 end
 
-local function buildGround(world)
-	part(world, "Ground", Vector3.new(240, 2, 240), CFrame.new(0, -1, 20),
-		Color3.fromRGB(105, 190, 95), Enum.Material.Grass)
-	part(world, "Plaza", Vector3.new(56, 0.6, 56), CFrame.new(0, 0.3, 0),
-		Color3.fromRGB(235, 215, 170), Enum.Material.Sand)
-	-- Plaza ring trim.
-	part(world, "PlazaTrim", Vector3.new(60, 0.35, 60), CFrame.new(0, 0.15, 0),
-		Color3.fromRGB(200, 120, 90), Enum.Material.Brick)
+local function buildSpawn(root: Folder)
+	-- Spawn pad at (0, 26): flat cylinder radius 5, top Y=0.2.
+	local pad = disc(root, "SpawnPad", 5, 0.2, 0, 0.2, 26, Color3.fromRGB(90, 200, 255), Enum.Material.Neon)
+	local spawn = Instance.new("SpawnLocation")
+	spawn.Name = "SpawnLocation"
+	spawn.Size = Vector3.new(6, 0.4, 6)
+	spawn.CFrame = CFrame.new(0, 0.2, 26)
+	spawn.Color = Color3.fromRGB(90, 200, 255)
+	spawn.Material = Enum.Material.Neon
+	spawn.Anchored = true
+	spawn.Neutral = true
+	spawn.Transparency = 0.4
+	spawn.Parent = root
+	-- Welcome sign on two posts at (0, 40), board centre Y=9.
+	sign(root, 0, 40, 9, 13, 3, "SELAMAT DATANG DI BRAINROT BAZAAR!", Color3.fromRGB(64, 156, 255), Color3.fromRGB(255, 255, 255))
+	return pad
 end
 
-local function buildFountain(world)
-	local fountain = Instance.new("Model")
-	fountain.Name = "Fountain"
-	fountain.Parent = world
-	part(fountain, "Basin", Vector3.new(16, 1.6, 16), CFrame.new(0, 0.8, 0),
-		Color3.fromRGB(170, 180, 195), Enum.Material.Marble)
-	local rim = part(fountain, "Rim", Vector3.new(17.5, 0.7, 17.5), CFrame.new(0, 1.7, 0),
-		Color3.fromRGB(140, 150, 170), Enum.Material.Marble)
-	rim.Shape = Enum.PartType.Cylinder
-	local pillar = part(fountain, "Pillar", Vector3.new(2.2, 6, 2.2), CFrame.new(0, 3.5, 0),
-		Color3.fromRGB(170, 180, 195), Enum.Material.Marble)
-	pillar.Shape = Enum.PartType.Cylinder
-	local crown = part(fountain, "Crown", Vector3.new(3.4, 3.4, 3.4), CFrame.new(0, 7.6, 0),
-		Color3.fromRGB(255, 205, 60), Enum.Material.Neon)
+local PLOT_NAME_COLORS = {
+	Color3.fromRGB(255, 110, 110), Color3.fromRGB(255, 176, 32), Color3.fromRGB(120, 230, 140), Color3.fromRGB(90, 200, 255),
+	Color3.fromRGB(178, 82, 255), Color3.fromRGB(255, 120, 200), Color3.fromRGB(120, 240, 220), Color3.fromRGB(250, 240, 150),
+}
+
+local function buildPlots(root: Folder)
+	local plots = {}
+	local index = 0
+	for _, cz in ipairs({ -84, 84 }) do
+		for _, cx in ipairs({ -102, -34, 34, 102 }) do
+			index += 1
+			local g = folder(root, "Plot" .. index)
+			-- Base slab 44x30, top Y=0.25.
+			box(g, "Slab", 44, PLOT_TOP, 30, cx, 0, cz, PLOT_NAME_COLORS[index], Enum.Material.SmoothPlastic)
+			-- 6 pads in 2 rows of 3: flat cylinders radius 2.6, top Y=0.45.
+			local padPositions = {}
+			for row, dz in ipairs({ -6.5, 5 }) do
+				for col, dx in ipairs({ -13, 0, 13 }) do
+					local padIndex = (row - 1) * 3 + col
+					local pad = disc(g, "Pad" .. padIndex, 2.6, PAD_TOP - PLOT_TOP, cx + dx, PAD_TOP, cz + dz, Color3.fromRGB(240, 240, 245), Enum.Material.SmoothPlastic)
+					pad:SetAttribute("PlotIndex", index)
+					pad:SetAttribute("PadIndex", padIndex)
+					padPositions[padIndex] = Vector3.new(cx + dx, PAD_TOP, cz + dz)
+				end
+			end
+			-- Collect pad (green, 5x5, top Y=0.45) at the plot's front edge:
+			-- the edge facing the map centre.
+			local frontDir = cz > 0 and -1 or 1
+			local collect = box(g, "CollectPad", 5, PAD_TOP, 5, cx, 0, cz + frontDir * 12, Color3.fromRGB(46, 204, 113), Enum.Material.Neon)
+			collect:SetAttribute("PlotIndex", index)
+			-- Lock button post at the front corner.
+			local lockBase = box(g, "LockPost", 0.7, 2.2, 0.7, cx + 19, PLOT_TOP, cz + frontDir * 12, Color3.fromRGB(90, 90, 100), Enum.Material.Metal)
+			local lockButton = box(g, "LockButton", 1.6, 0.7, 1.6, cx + 19, PLOT_TOP + 2.2, cz + frontDir * 12, Color3.fromRGB(231, 76, 60), Enum.Material.SmoothPlastic)
+			lockButton:SetAttribute("PlotIndex", index)
+			-- Plot sign on posts, board centre Y=8, naming the plot.
+			sign(g, cx, cz - frontDir * 13, 8, 15, 2.6, "BASE " .. index, PLOT_NAME_COLORS[index], Color3.fromRGB(40, 40, 50))
+			table.insert(plots, {
+				Index = index,
+				Center = Vector3.new(cx, 0, cz),
+				PadPositions = padPositions,
+				CollectPad = collect,
+				LockButton = lockButton,
+				Folder = g,
+			})
+		end
+	end
+	return plots
+end
+
+local function buildFountain(root: Folder)
+	local g = folder(root, "Fountain")
+	-- Basin cylinder radius 9 at the plaza centre (0, 44), rim top Y=1.2.
+	disc(g, "Basin", 9, 1.2, 0, 1.2, 44, Color3.fromRGB(120, 180, 230), Enum.Material.SmoothPlastic)
+	disc(g, "BasinFloor", 7.8, 1.0, 0, 1.0, 44, Color3.fromRGB(70, 130, 190), Enum.Material.SmoothPlastic)
+	-- Central column up to Y=6 with a small crown ball.
+	box(g, "Column", 1.6, 6, 1.6, 0, 0, 44, Color3.fromRGB(200, 215, 235), Enum.Material.Marble)
+	local crown = box(g, "Crown", 1.6, 1.6, 1.6, 0, 6, 44, Color3.fromRGB(120, 200, 255), Enum.Material.Neon)
 	crown.Shape = Enum.PartType.Ball
-	-- The animated water disc: WorldBuilder.Animate spins and pulses it.
-	local water = part(fountain, "WaterDisc", Vector3.new(14.5, 0.4, 14.5), CFrame.new(0, 1.75, 0),
-		Color3.fromRGB(70, 180, 255), Enum.Material.Glass)
-	water.Shape = Enum.PartType.Cylinder
-	water.Transparency = 0.3
+	-- Animated water disc (radius 7.5) at Y=1.35; init rotates it slowly.
+	local water = disc(g, "Water", 7.5, 0.15, 0, 1.35, 44, Color3.fromRGB(90, 200, 255), Enum.Material.Glass)
+	water.Transparency = 0.35
 	water.CanCollide = false
 	return water
 end
 
-local function buildStall(world, index, position, awningColor)
-	local stall = Instance.new("Model")
-	stall.Name = "Stall" .. index
-	stall.Parent = world
-	local baseAngle = math.atan2(-position.X, -position.Z)
-	part(stall, "Counter", Vector3.new(10, 2.4, 4), CFrame.new(position) * CFrame.Angles(0, baseAngle, 0) * CFrame.new(0, 1.2, 0),
-		Color3.fromRGB(160, 110, 70), Enum.Material.Wood)
-	for _, dx in ipairs({ -4.5, 4.5 }) do
-		part(stall, "Pole", Vector3.new(0.4, 6.5, 0.4),
-			CFrame.new(position) * CFrame.Angles(0, baseAngle, 0) * CFrame.new(dx, 3.25, -1.5),
-			Color3.fromRGB(110, 80, 55), Enum.Material.Wood)
+local function buildStalls(root: Folder)
+	-- 4 market stalls at (±16, 62) and (±16, 26), facing the plaza centre.
+	local awningColors = { Color3.fromRGB(231, 76, 60), Color3.fromRGB(64, 156, 255), Color3.fromRGB(46, 204, 113), Color3.fromRGB(255, 176, 32) }
+	local i = 0
+	for _, sx in ipairs({ -16, 16 }) do
+		for _, sz in ipairs({ 62, 26 }) do
+			i += 1
+			local g = folder(root, "Stall" .. i)
+			box(g, "Counter", 8, 1.6, 3, sx, 0, sz, Color3.fromRGB(160, 110, 65), Enum.Material.Wood)
+			for _, ox in ipairs({ -3.7, 3.7 }) do
+				for _, oz in ipairs({ -1.7, 1.7 }) do
+					box(g, "Post", 0.45, 5, 0.45, sx + ox, 0, sz + oz, Color3.fromRGB(120, 85, 50), Enum.Material.Wood)
+				end
+			end
+			-- Striped awning slab tilted at Y=5.2: two-tone by pairing a
+			-- coloured slab with a white stripe slab beside it.
+			local tilt = (sz > 44) and -0.16 or 0.16
+			local awn = box(g, "Awning", 9, 0.3, 4.6, sx, 5.05, sz, awningColors[i], Enum.Material.SmoothPlastic)
+			awn.CFrame = CFrame.new(sx, 5.2, sz) * CFrame.Angles(tilt, 0, 0)
+			local stripe = box(g, "AwningStripe", 9, 0.32, 1.4, sx, 5.05, sz, Color3.fromRGB(250, 250, 250), Enum.Material.SmoothPlastic)
+			stripe.CFrame = CFrame.new(sx, 5.2, sz) * CFrame.Angles(tilt, 0, 0)
+			-- A little merchandise: three coloured crates on the counter.
+			for c = -1, 1 do
+				box(g, "Crate", 1.1, 1.1, 1.1, sx + c * 2, 1.6, sz, awningColors[((i + c + 4) % 4) + 1], Enum.Material.SmoothPlastic)
+			end
+		end
 	end
-	-- Striped awning: alternating colour slats tilted over the counter.
-	for i = 0, 5 do
-		local stripeColor = i % 2 == 0 and awningColor or Color3.fromRGB(255, 255, 255)
-		part(stall, "AwningStripe", Vector3.new(1.8, 0.25, 6.5),
-			CFrame.new(position) * CFrame.Angles(0, baseAngle, 0) * CFrame.new(-4.5 + i * 1.8, 6.2, 0) * CFrame.Angles(0.35, 0, 0),
-			stripeColor, Enum.Material.Fabric)
-	end
-	-- Crates of colourful "goods" on the counter.
-	for i = 1, 3 do
-		part(stall, "Crate", Vector3.new(1.6, 1.6, 1.6),
-			CFrame.new(position) * CFrame.Angles(0, baseAngle, 0) * CFrame.new(-3 + i * 2.4, 3.2, 0),
-			Color3.fromHSV(i * 0.22, 0.6, 0.95), Enum.Material.SmoothPlastic)
-	end
-	return stall
 end
 
-local function buildFerrisWheel(world)
+-- Ferris wheel state for the RotateWheel driver: every moving part's
+-- original CFrame, rotated about the X axis through the hub each frame.
+local wheelParts: { Part } = {}
+local WHEEL_HUB = Vector3.new(-128, 26, -52)
+
+local function buildFerrisWheel(root: Folder)
+	local g = folder(root, "FerrisWheel")
+	-- Two A-frame legs from the ground up to the hub at Y=26.
+	for _, footZ in ipairs({ -62, -42 }) do
+		local mid = Vector3.new(-128, 13, (footZ + -52) / 2)
+		local tilt = math.atan2(footZ - -52, 26) -- lean in the YZ plane
+		local leg = box(g, "Leg", 1.6, 28.5, 1.6, -128, 0, footZ, Color3.fromRGB(200, 60, 90), Enum.Material.Metal)
+		leg.CFrame = CFrame.new(mid) * CFrame.Angles(-tilt, 0, 0)
+	end
+	local hub = box(g, "Hub", 3, 3, 3, -128, 24.5, -52, Color3.fromRGB(255, 209, 26), Enum.Material.Metal)
+	hub.Shape = Enum.PartType.Ball
+	-- The moving group: ring segments, spokes and 8 pods on the rim, in
+	-- the YZ plane at X=-128 (the wheel faces the plaza, +X).
 	local wheel = Instance.new("Model")
-	wheel.Name = "BianglalaBrainrot"
-	wheel.Parent = world
-	local center = Vector3.new(-95, 26, -20)
-	for _, dz in ipairs({ -3, 3 }) do
-		part(wheel, "Leg", Vector3.new(1.2, 28, 1.2),
-			CFrame.new(center.X, 13, center.Z + dz) * CFrame.Angles(0.25, 0, 0),
-			Color3.fromRGB(255, 120, 170), Enum.Material.Metal)
+	wheel.Name = "Wheel"
+	wheel.Parent = g
+	local podColors = { Color3.fromRGB(255, 110, 110), Color3.fromRGB(255, 176, 32), Color3.fromRGB(120, 230, 140), Color3.fromRGB(90, 200, 255), Color3.fromRGB(178, 82, 255), Color3.fromRGB(255, 120, 200), Color3.fromRGB(120, 240, 220), Color3.fromRGB(250, 240, 150) }
+	for seg = 0, 15 do
+		local th = seg * math.pi / 8
+		local y = WHEEL_HUB.Y + 20 * math.sin(th)
+		local z = WHEEL_HUB.Z + 20 * math.cos(th)
+		local segPart = box(wheel, "RingSegment", 1.2, 8.4, 1.8, -128, 0, -52, Color3.fromRGB(240, 240, 250), Enum.Material.Metal)
+		segPart.CFrame = CFrame.new(-128, y, z) * CFrame.Angles(-th, 0, 0)
+		table.insert(wheelParts, segPart)
 	end
-	local hub = part(wheel, "Hub", Vector3.new(3, 3, 8), CFrame.new(center),
-		Color3.fromRGB(255, 205, 60), Enum.Material.Neon)
-	hub.Shape = Enum.PartType.Cylinder
-	-- The rotating group: spokes and brainrot pods around the hub.
-	local rotor = Instance.new("Model")
-	rotor.Name = "Rotor"
-	rotor.Parent = wheel
-	local pivot = part(rotor, "Pivot", Vector3.new(1, 1, 1), CFrame.new(center),
-		Color3.fromRGB(255, 255, 255), Enum.Material.SmoothPlastic)
-	pivot.Transparency = 1
-	pivot.CanCollide = false
-	rotor.PrimaryPart = pivot
-	for i = 1, 8 do
-		local angle = (i - 1) * math.pi / 4
-		local rimPos = center + Vector3.new(math.cos(angle) * 17, math.sin(angle) * 17, 0)
-		local spoke = part(rotor, "Spoke", Vector3.new(17, 0.7, 0.7),
-			CFrame.new((center + rimPos) / 2) * CFrame.Angles(0, 0, angle),
-			Color3.fromRGB(120, 200, 255), Enum.Material.Metal)
-		spoke.CanCollide = false
-		local pod = part(rotor, "Pod", Vector3.new(4.2, 3.6, 4.2), CFrame.new(rimPos),
-			Color3.fromHSV(i / 8, 0.65, 1), Enum.Material.SmoothPlastic)
-		pod.CanCollide = false
-		local rider = part(rotor, "PodRider", Vector3.new(2, 2, 2),
-			CFrame.new(rimPos + Vector3.new(0, 2.6, 0)), Color3.fromHSV(i / 8 + 0.4, 0.6, 1),
-			Enum.Material.SmoothPlastic)
-		rider.CanCollide = false
+	for s = 0, 3 do
+		local th = s * math.pi / 4
+		local spoke = box(wheel, "Spoke", 0.8, 40, 0.8, -128, 0, -52, Color3.fromRGB(200, 200, 215), Enum.Material.Metal)
+		spoke.CFrame = CFrame.new(WHEEL_HUB) * CFrame.Angles(-th, 0, 0)
+		table.insert(wheelParts, spoke)
 	end
-	floatingSign(wheel, "WheelSign", "BIANGLALA BRAINROT", center + Vector3.new(0, -24, -6),
-		Vector2.new(300, 60), Color3.fromRGB(255, 170, 220))
-	return rotor
+	for pod = 0, 7 do
+		local th = pod * math.pi / 4
+		local y = WHEEL_HUB.Y + 20 * math.sin(th)
+		local z = WHEEL_HUB.Z + 20 * math.cos(th)
+		local p = box(wheel, "Pod", 3.4, 3, 3.4, -128, 0, -52, podColors[pod + 1], Enum.Material.SmoothPlastic)
+		p.CFrame = CFrame.new(-128, y - 1.5, z)
+		table.insert(wheelParts, p)
+	end
+	-- Sign on posts at (-112, -40), board centre Y=8.
+	sign(g, -112, -40, 8, 15, 2.6, "BIANGLALA BRAINROT", Color3.fromRGB(200, 60, 90), Color3.fromRGB(255, 255, 255))
+	return wheel
 end
 
-local function buildTower(world)
-	local tower = Instance.new("Model")
-	tower.Name = "MenaraBrainrot"
-	tower.Parent = world
-	local basePos = Vector3.new(98, 0, -24)
-	for level = 0, 5 do
-		local width = 13 - level * 1.4
-		part(tower, "Level", Vector3.new(width, 7, width),
-			CFrame.new(basePos.X, 3.5 + level * 7, basePos.Z),
-			Color3.fromHSV(0.75 - level * 0.04, 0.45, 0.9), Enum.Material.Brick)
+-- Rotate the wheel by `angle` radians about the X axis through the hub.
+-- Original CFrames are captured lazily on the first call.
+local wheelOriginals: { [Part]: CFrame } = nil
+function WorldBuilder.RotateWheel(angle: number)
+	if wheelOriginals == nil then
+		wheelOriginals = {}
+		for _, p in ipairs(wheelParts) do
+			wheelOriginals[p] = p.CFrame
+		end
 	end
-	local beacon = part(tower, "Beacon", Vector3.new(3.2, 3.2, 3.2), CFrame.new(basePos.X, 47, basePos.Z),
-		Color3.fromRGB(255, 80, 80), Enum.Material.Neon)
+	local rot = CFrame.new(WHEEL_HUB) * CFrame.Angles(angle, 0, 0) * CFrame.new(-WHEEL_HUB)
+	for _, p in ipairs(wheelParts) do
+		p.CFrame = rot * wheelOriginals[p]
+	end
+end
+
+local function buildTower(root: Folder)
+	local g = folder(root, "Tower")
+	-- Stacked tapering boxes from Y=0 to Y=44 at (128, -52).
+	local layers = { { 18, 10 }, { 15, 9 }, { 12, 8 }, { 9, 7 }, { 6, 10 } }
+	local colors = { Color3.fromRGB(120, 90, 200), Color3.fromRGB(140, 100, 215), Color3.fromRGB(160, 115, 230), Color3.fromRGB(185, 135, 245), Color3.fromRGB(210, 160, 255) }
+	local y = 0
+	for i, layer in ipairs(layers) do
+		box(g, "Layer" .. i, layer[1], layer[2], layer[1], 128, y, -52, colors[i], Enum.Material.SmoothPlastic)
+		y += layer[2]
+	end
+	-- Beacon sphere at Y=47 (its base rests on the Y=44 roof).
+	local beacon = box(g, "Beacon", 6, 6, 6, 128, 44, -52, Color3.fromRGB(255, 90, 90), Enum.Material.Neon)
 	beacon.Shape = Enum.PartType.Ball
-	beacon.CanCollide = false
 	local light = Instance.new("PointLight")
-	light.Color = Color3.fromRGB(255, 120, 120)
+	light.Color = Color3.fromRGB(255, 90, 90)
 	light.Range = 40
 	light.Brightness = 2
 	light.Parent = beacon
-	floatingSign(tower, "TowerSign", "MENARA BRAINROT", basePos + Vector3.new(0, 54, 0),
-		Vector2.new(280, 56), Color3.fromRGB(255, 150, 150))
-	return beacon
+	sign(g, 112, -40, 8, 14, 2.6, "MENARA BRAINROT", Color3.fromRGB(120, 90, 200), Color3.fromRGB(255, 255, 255))
 end
 
-local function buildRainbowArch(world, position)
-	local arch = Instance.new("Model")
-	arch.Name = "RainbowArch"
-	arch.Parent = world
-	local colors = {
-		Color3.fromRGB(255, 70, 70), Color3.fromRGB(255, 160, 40),
-		Color3.fromRGB(255, 235, 90), Color3.fromRGB(90, 220, 110),
-		Color3.fromRGB(80, 160, 255), Color3.fromRGB(180, 100, 255),
-	}
-	for band, color in ipairs(colors) do
-		local radius = 10 + band * 1.1
-		for step = 0, 10 do
-			local angle = math.pi * step / 10
-			local segPos = position + Vector3.new(math.cos(angle) * radius, math.sin(angle) * radius, 0)
-			local seg = part(arch, "ArchBand", Vector3.new(2.6, 1.05, 1.6), CFrame.new(segPos),
-				color, Enum.Material.Neon)
-			seg.CanCollide = false
-		end
+local function buildRainbowArch(root: Folder)
+	-- 7 coloured arc segments from (-10, 58) up to Y=12 and back to
+	-- (10, 58): boxes chorded across a semicircle of radius 10.
+	local g = folder(root, "RainbowArch")
+	local colors = { Color3.fromRGB(255, 60, 60), Color3.fromRGB(255, 140, 40), Color3.fromRGB(255, 220, 60), Color3.fromRGB(70, 210, 90), Color3.fromRGB(70, 150, 255), Color3.fromRGB(130, 90, 230), Color3.fromRGB(255, 110, 200) }
+	for i = 1, 7 do
+		local a0 = math.pi * (i - 1) / 7
+		local a1 = math.pi * i / 7
+		local x0, y0 = 10 * math.cos(a0), 10 * math.sin(a0)
+		local x1, y1 = 10 * math.cos(a1), 10 * math.sin(a1)
+		local mx, my = (x0 + x1) / 2, (y0 + y1) / 2
+		local len = math.sqrt((x1 - x0) ^ 2 + (y1 - y0) ^ 2) + 0.7
+		local seg = box(g, "ArcSegment" .. i, len, 1.4, 1.4, mx, 0, 58, colors[i], Enum.Material.Neon)
+		seg.CFrame = CFrame.new(mx, my, 58) * CFrame.Angles(0, 0, math.atan2(y1 - y0, x1 - x0))
 	end
-	return arch
 end
 
-local function buildTree(world, position, scale)
-	local tree = Instance.new("Model")
-	tree.Name = "Tree"
-	tree.Parent = world
-	part(tree, "Trunk", Vector3.new(1.2 * scale, 4 * scale, 1.2 * scale),
-		CFrame.new(position.X, 2 * scale, position.Z), Color3.fromRGB(120, 85, 55), Enum.Material.Wood)
-	local leaves = part(tree, "Leaves", Vector3.new(5 * scale, 5 * scale, 5 * scale),
-		CFrame.new(position.X, (4 + 2.5) * scale, position.Z), Color3.fromRGB(60, 165, 70), Enum.Material.Grass)
-	leaves.Shape = Enum.PartType.Ball
-	leaves.CanCollide = false
-end
-
-local function buildRock(world, position, scale)
-	local rock = part(world, "Rock", Vector3.new(2.4 * scale, 1.6 * scale, 2 * scale),
-		CFrame.new(position) * CFrame.Angles(0, position.X, 0.3), Color3.fromRGB(140, 140, 150), Enum.Material.Rock)
-	rock.CanCollide = true
-end
-
-local function buildLamp(world, position)
-	local lamp = Instance.new("Model")
-	lamp.Name = "Lamp"
-	lamp.Parent = world
-	part(lamp, "Pole", Vector3.new(0.35, 6, 0.35), CFrame.new(position.X, 3, position.Z),
-		Color3.fromRGB(50, 50, 60), Enum.Material.Metal)
-	local bulb = part(lamp, "Bulb", Vector3.new(1.1, 1.1, 1.1), CFrame.new(position.X, 6.4, position.Z),
-		Color3.fromRGB(255, 240, 170), Enum.Material.Neon)
-	bulb.Shape = Enum.PartType.Ball
-	bulb.CanCollide = false
-	local light = Instance.new("PointLight")
-	light.Color = Color3.fromRGB(255, 240, 190)
-	light.Range = 18
-	light.Brightness = 1.2
-	light.Parent = bulb
-end
-
--- Build everything and return the animated handles:
--- { WaterDisc, WheelRotor, TowerBeacon, World }
-function WorldBuilder.Build(gameState)
-	local world = Instance.new("Folder")
-	world.Name = "BazaarWorld"
-	world.Parent = workspace
-
-	buildGround(world)
-	local water = buildFountain(world)
-
-	local stallColors = {
-		Color3.fromRGB(255, 90, 90), Color3.fromRGB(70, 170, 255),
-		Color3.fromRGB(255, 190, 50), Color3.fromRGB(140, 230, 130),
-	}
-	local stallSpots = {
-		Vector3.new(-22, 0, -20), Vector3.new(22, 0, -20),
-		Vector3.new(-22, 0, 20), Vector3.new(22, 0, 20),
-	}
-	for i, spot in ipairs(stallSpots) do
-		buildStall(world, i, spot, stallColors[i])
+local function buildBillboards(root: Folder)
+	-- 6 rarity billboards on posts along the belt's south side (Z=14),
+	-- board centres Y=7, one per rarity in ladder order.
+	local rarities = { "COMMON", "RARE", "EPIC", "LEGENDARY", "MYTHIC", "DIVINE" }
+	local colors = { Color3.fromRGB(180, 188, 196), Color3.fromRGB(64, 156, 255), Color3.fromRGB(178, 82, 255), Color3.fromRGB(255, 176, 32), Color3.fromRGB(255, 64, 96), Color3.fromRGB(255, 244, 160) }
+	for i, x in ipairs({ -60, -36, -12, 12, 36, 60 }) do
+		sign(root, x, 14, 7, 11, 2.6, rarities[i], colors[i], Color3.fromRGB(35, 35, 45))
 	end
+end
 
-	local rotor = buildFerrisWheel(world)
-	local beacon = buildTower(world)
-	buildRainbowArch(world, Vector3.new(0, 0, 68))
-
-	-- Nature and light dressing scattered between the landmarks.
-	local treeSpots = {
-		Vector3.new(-40, 0, -34), Vector3.new(42, 0, -36), Vector3.new(-48, 0, 8),
-		Vector3.new(50, 0, 10), Vector3.new(-14, 0, -40), Vector3.new(16, 0, 38),
-		Vector3.new(-88, 0, 30), Vector3.new(88, 0, 34),
-	}
+local function buildScatter(root: Folder)
+	local g = folder(root, "Scatter")
+	-- 14 trees along the map edges: trunk cylinder Y 0..4, foliage at Y=6.
+	local treeSpots = { { -170, -130 }, { 170, -130 }, { -170, 130 }, { 170, 130 }, { -150, 0 }, { 150, 20 }, { -60, -132 }, { 60, 132 }, { 120, -132 }, { -120, 132 }, { 0, -136 }, { 0, 136 }, { 176, -60 }, { -176, 60 } }
 	for i, spot in ipairs(treeSpots) do
-		buildTree(world, spot, 0.9 + (i % 3) * 0.25)
+		local trunk = disc(g, "TreeTrunk" .. i, 0.7, 4, spot[1], 4, spot[2], Color3.fromRGB(130, 90, 55), Enum.Material.Wood)
+		trunk.Size = Vector3.new(4, 1.4, 1.4)
+		trunk.CFrame = CFrame.new(spot[1], 2, spot[2]) * CFrame.Angles(0, 0, math.rad(90))
+		local foliage = box(g, "TreeTop" .. i, 5.5, 5.5, 5.5, spot[1], 3.5, spot[2], Color3.fromRGB(50, 160, 60), Enum.Material.Grass)
+		foliage.Shape = Enum.PartType.Ball
+		foliage.CFrame = CFrame.new(spot[1], 6, spot[2])
 	end
-	local rockSpots = {
-		Vector3.new(-60, 0.6, -10), Vector3.new(63, 0.6, -14),
-		Vector3.new(-35, 0.6, 62), Vector3.new(38, 0.6, 60),
+	-- 8 rocks, grey and lumpy (squashed balls half-buried look avoided:
+	-- they sit on the ground like everything else).
+	local rockSpots = { { -150, -100 }, { 150, 110 }, { -90, 136 }, { 90, -136 }, { 176, 90 }, { -176, -90 }, { 40, 140 }, { -40, -140 } }
+	for i, spot in ipairs(rockSpots) do
+		local rock = box(g, "Rock" .. i, 3.2, 2.2, 2.8, spot[1], 0, spot[2], Color3.fromRGB(140, 140, 150), Enum.Material.Slate)
+		rock.CFrame = CFrame.new(spot[1], 1.1, spot[2]) * CFrame.Angles(0, math.rad(i * 37), 0)
+	end
+	-- 10 lamp posts along the paths: post to Y=7 plus a glowing sphere.
+	local lampSpots = { { -30, 15 }, { 30, 15 }, { -60, 30 }, { 60, 30 }, { 0, 70 }, { -34, 60 }, { 34, 60 }, { -102, 60 }, { 102, 60 }, { 0, -20 } }
+	for i, spot in ipairs(lampSpots) do
+		box(g, "LampPost" .. i, 0.4, 7, 0.4, spot[1], 0, spot[2], Color3.fromRGB(60, 60, 70), Enum.Material.Metal)
+		local bulb = box(g, "LampBulb" .. i, 1.3, 1.3, 1.3, spot[1], 7, spot[2], Color3.fromRGB(255, 240, 170), Enum.Material.Neon)
+		bulb.Shape = Enum.PartType.Ball
+		local light = Instance.new("PointLight")
+		light.Color = Color3.fromRGB(255, 240, 170)
+		light.Range = 18
+		light.Brightness = 1.2
+		light.Parent = bulb
+	end
+end
+
+local function buildGacha(root: Folder)
+	-- The gacha machine on the plaza at (-18, 44): a chunky base, a glass
+	-- dome full of colourful capsules, and a crank. GachaService finds
+	-- the base part by name and hangs its ProximityPrompt on it.
+	local g = folder(root, "GachaMachine")
+	local base = box(g, "GachaBase", 4.4, 3, 4.4, -18, 0, 44, Color3.fromRGB(255, 90, 140), Enum.Material.SmoothPlastic)
+	base:SetAttribute("IsGacha", true)
+	local dome = box(g, "GachaDome", 4, 4, 4, -18, 3, 44, Color3.fromRGB(200, 240, 255), Enum.Material.Glass)
+	dome.Shape = Enum.PartType.Ball
+	dome.Transparency = 0.4
+	dome.CanCollide = false
+	local rng = Random.new(7)
+	for i = 1, 8 do
+		local cap = box(g, "Capsule" .. i, 0.9, 0.9, 0.9, -18, 3.4, 44, Color3.fromHsv(rng:NextNumber(), 0.75, 1), Enum.Material.SmoothPlastic)
+		cap.Shape = Enum.PartType.Ball
+		cap.CFrame = CFrame.new(-18 + rng:NextNumber(-1.2, 1.2), 3.4 + rng:NextNumber(0, 1.4), 44 + rng:NextNumber(-1.2, 1.2))
+		cap.CanCollide = false
+	end
+	box(g, "GachaCrank", 0.5, 1.6, 0.5, -15.6, 1.2, 44, Color3.fromRGB(255, 209, 26), Enum.Material.Metal)
+	sign(g, -18, 51, 8, 11, 2.4, "GACHA BRAINROT", Color3.fromRGB(255, 90, 140), Color3.fromRGB(255, 255, 255))
+	return base
+end
+
+-- A burst of procedural sparkle parts around a point (Divine spawns and
+-- gacha jackpots). Returns the folder; the caller destroys it shortly.
+function WorldBuilder.sparkleBurst(parent: Instance, at: Vector3): Folder
+	local g = folder(parent, "SparkleBurst")
+	local rng = Random.new(math.floor(os.clock() * 1000) % 100000)
+	for i = 1, 12 do
+		local s = box(g, "Spark" .. i, 0.45, 0.45, 0.45, at.X, 0, at.Z, Color3.fromHsv(rng:NextNumber(), 0.6, 1), Enum.Material.Neon)
+		s.Shape = Enum.PartType.Ball
+		s.CanCollide = false
+		s.CFrame = CFrame.new(at + Vector3.new(rng:NextNumber(-2.4, 2.4), rng:NextNumber(0.5, 4), rng:NextNumber(-2.4, 2.4)))
+	end
+	return g
+end
+
+function WorldBuilder.Build(workspace: Workspace)
+	local root = folder(workspace, "BrainrotBazaar")
+	buildGroundAndPaths(root)
+	local belt = buildBelt(root)
+	buildSpawn(root)
+	local plots = buildPlots(root)
+	local water = buildFountain(root)
+	buildStalls(root)
+	buildFerrisWheel(root)
+	buildTower(root)
+	buildRainbowArch(root)
+	buildBillboards(root)
+	buildScatter(root)
+	local gachaBase = buildGacha(root)
+	local walkers = folder(workspace, "Walkers")
+	return {
+		Root = root,
+		Belt = belt,
+		Plots = plots,
+		WalkersFolder = walkers,
+		BeltTop = BELT_TOP,
+		PadTop = PAD_TOP,
+		FountainWater = water,
+		GachaBase = gachaBase,
 	}
-	for _, spot in ipairs(rockSpots) do
-		buildRock(world, spot, 1 + (spot.X % 3) * 0.2)
-	end
-	local lampSpots = {
-		Vector3.new(-28, 0, 0), Vector3.new(28, 0, 0), Vector3.new(0, 0, -28),
-		Vector3.new(0, 0, 28), Vector3.new(-80, 0, 44), Vector3.new(80, 0, 44),
-	}
-	for _, spot in ipairs(lampSpots) do
-		buildLamp(world, spot)
-	end
-
-	WorldBuilder.BuildShop(world, gameState)
-	WorldBuilder.BuildBases(world, gameState)
-	WorldBuilder.BuildRarityBillboards(world)
-
-	WorldBuilder.MakeSign(world, "WelcomeSign", "SELAMAT DATANG DI BRAINROT BAZAAR!",
-		Vector3.new(0, 0, 78), Vector3.new(30, 5, 0.6), Color3.fromRGB(255, 140, 60))
-	floatingSign(world, "PlazaSign", "PLAZA BRAINROT", Vector3.new(0, 16, 0),
-		Vector2.new(260, 52), Color3.fromRGB(255, 230, 140))
-
-	return { WaterDisc = water, WheelRotor = rotor, TowerBeacon = beacon, World = world }
-end
-
--- The conveyor shop: a raised belt, side rails, end caps and the big arch.
-function WorldBuilder.BuildShop(world, gameState)
-	local shop = Instance.new("Model")
-	shop.Name = "TokoBrainrot"
-	shop.Parent = world
-	local beltY = gameState.BELT_Y
-	part(shop, "BeltBase", Vector3.new(150, 1.2, 12), CFrame.new(0, beltY - 0.6, 42),
-		Color3.fromRGB(60, 60, 75), Enum.Material.Metal)
-	local belt = part(shop, "BeltTop", Vector3.new(150, 0.4, 10), CFrame.new(0, beltY + 0.2, 42),
-		Color3.fromRGB(45, 45, 55), Enum.Material.Rubber)
-	belt.Name = "BeltTop"
-	for _, dz in ipairs({ -5.6, 5.6 }) do
-		part(shop, "Rail", Vector3.new(150, 1, 0.7), CFrame.new(0, beltY + 0.9, 42 + dz),
-			Color3.fromRGB(255, 170, 40), Enum.Material.Metal)
-	end
-	-- Moving-look chevrons painted along the belt.
-	for x = -72, 72, 8 do
-		local chev = part(shop, "Chevron", Vector3.new(2.4, 0.1, 2.4), CFrame.new(x, beltY + 0.45, 42),
-			Color3.fromRGB(255, 220, 80), Enum.Material.Neon)
-		chev.CanCollide = false
-	end
-	-- Shop arch with the store name over the belt's middle.
-	for _, dx in ipairs({ -8, 8 }) do
-		part(shop, "ArchPost", Vector3.new(1.4, 13, 1.4), CFrame.new(dx, 6.5, 34),
-			Color3.fromRGB(255, 120, 150), Enum.Material.SmoothPlastic)
-	end
-	part(shop, "ArchTop", Vector3.new(19, 2.2, 1.4), CFrame.new(0, 13.4, 34),
-		Color3.fromRGB(255, 120, 150), Enum.Material.SmoothPlastic)
-	WorldBuilder.MakeSign(shop, "ShopSign", "TOKO BRAINROT", Vector3.new(0, 11, 33.2),
-		Vector3.new(20, 4.4, 0.5), Color3.fromRGB(200, 50, 110))
-	return shop
-end
-
--- Eight bases: floor, low walls, six glowing pads each, a green collect pad,
--- a lock button pillar and an owner board. Returns nothing; the pads are
--- found by name (Base<i>/Pad<j>) from the game logic.
-function WorldBuilder.BuildBases(world, gameState)
-	local bases = Instance.new("Folder")
-	bases.Name = "Bases"
-	bases.Parent = world
-	for i = 1, gameState.BASE_COUNT do
-		local origin = gameState.GetBaseOrigin(i)
-		local base = Instance.new("Model")
-		base.Name = "Base" .. i
-		base.Parent = bases
-		local hue = (i - 1) / gameState.BASE_COUNT
-		local baseColor = Color3.fromHSV(hue, 0.35, 0.95)
-		part(base, "Floor", gameState.BASE_SIZE, CFrame.new(origin.X, 0.5, origin.Z),
-			baseColor, Enum.Material.SmoothPlastic)
-		-- Low walls on three sides; the plaza-facing side stays open.
-		local half = gameState.BASE_SIZE
-		part(base, "WallBack", Vector3.new(half.X, 3, 1), CFrame.new(origin.X, 2, origin.Z - half.Z / 2),
-			baseColor, Enum.Material.Brick)
-		part(base, "WallLeft", Vector3.new(1, 3, half.Z), CFrame.new(origin.X - half.X / 2, 2, origin.Z),
-			baseColor, Enum.Material.Brick)
-		part(base, "WallRight", Vector3.new(1, 3, half.Z), CFrame.new(origin.X + half.X / 2, 2, origin.Z),
-			baseColor, Enum.Material.Brick)
-		for padIndex = 1, gameState.PADS_PER_BASE do
-			local pos = gameState.GetPadPosition(i, padIndex)
-			local pad = part(base, "Pad" .. padIndex, Vector3.new(6.5, 0.5, 6.5),
-				CFrame.new(pos.X, 1.25, pos.Z), Color3.fromRGB(120, 130, 150), Enum.Material.Neon)
-			pad.CanCollide = false
-		end
-		local collectPos = gameState.GetCollectPadPosition(i)
-		local collect = part(base, "CollectPad", Vector3.new(6, 0.5, 6),
-			CFrame.new(collectPos.X, 1.25, collectPos.Z), Color3.fromRGB(50, 220, 90), Enum.Material.Neon)
-		collect.CanCollide = false
-		local lockPos = gameState.GetLockButtonPosition(i)
-		part(base, "LockPillar", Vector3.new(1.6, 3.4, 1.6), CFrame.new(lockPos.X, 2.7, lockPos.Z),
-			Color3.fromRGB(90, 90, 105), Enum.Material.Metal)
-		local button = part(base, "LockButton", Vector3.new(1.7, 0.6, 1.7),
-			CFrame.new(lockPos.X, 4.6, lockPos.Z), Color3.fromRGB(255, 190, 40), Enum.Material.Neon)
-		button.Shape = Enum.PartType.Cylinder
-		button.CanCollide = false
-		WorldBuilder.MakeSign(base, "OwnerSign", "BASE " .. i, origin + Vector3.new(0, 0, -half.Z / 2 - 2),
-			Vector3.new(12, 3, 0.5), Color3.fromHSV(hue, 0.5, 0.8))
-	end
-	return bases
-end
-
--- Rarity billboards flanking the shop belt: the whole ladder at a glance,
--- each tier in its own colour, cheapest on the left, Divine on the right.
-function WorldBuilder.BuildRarityBillboards(world)
-	local tiers = {
-		{ "COMMON", Color3.fromRGB(205, 205, 205) },
-		{ "RARE", Color3.fromRGB(70, 160, 255) },
-		{ "EPIC", Color3.fromRGB(170, 85, 255) },
-		{ "LEGENDARY", Color3.fromRGB(255, 180, 30) },
-		{ "MYTHIC", Color3.fromRGB(255, 70, 120) },
-		{ "DIVINE", Color3.fromRGB(255, 240, 150) },
-	}
-	for i, tier in ipairs(tiers) do
-		local x = -62 + (i - 1) * 25
-		floatingSign(world, "RarityBillboard" .. tier[1], tier[1],
-			Vector3.new(x, 10, 30), Vector2.new(190, 44), tier[2])
-		part(world, "BillboardPost" .. i, Vector3.new(0.7, 9, 0.7), CFrame.new(x, 4.5, 30.6),
-			Color3.fromRGB(80, 70, 60), Enum.Material.Wood)
-	end
-	return world
-end
-
--- Slow ambient animation: fountain water spins and breathes, the ferris
--- wheel turns, the tower beacon pulses. Runs forever on its own task.
-function WorldBuilder.Animate(handles)
-	task.spawn(function()
-		local wheelAngle = 0
-		while true do
-			local dt = task.wait(0.05)
-			if handles.WaterDisc and handles.WaterDisc.Parent then
-				local spin = handles.WaterDisc.CFrame * CFrame.Angles(0, dt * 0.7, 0)
-				handles.WaterDisc.CFrame = spin
-				local pulse = 14.5 + math.sin(os.clock() * 2) * 0.5
-				handles.WaterDisc.Size = Vector3.new(pulse, 0.4, pulse)
-			end
-			if handles.WheelRotor and handles.WheelRotor.PrimaryPart then
-				wheelAngle += dt * 0.12
-				local pivot = handles.WheelRotor.PrimaryPart
-				local center = pivot.Position
-				for _, child in ipairs(handles.WheelRotor:GetChildren()) do
-					if child:IsA("BasePart") and child ~= pivot then
-						local offset = child.Position - center
-						local cosA = math.cos(dt * 0.12)
-						local sinA = math.sin(dt * 0.12)
-						local rotated = Vector3.new(
-							offset.X * cosA - offset.Y * sinA,
-							offset.X * sinA + offset.Y * cosA,
-							offset.Z)
-						child.CFrame = CFrame.new(center + rotated) * CFrame.Angles(0, 0, dt * 0.12) * (child.CFrame - child.Position)
-					end
-				end
-			end
-			if handles.TowerBeacon and handles.TowerBeacon.Parent then
-				local glow = 0.75 + math.sin(os.clock() * 3) * 0.25
-				handles.TowerBeacon.Color = Color3.fromRGB(255, math.floor(80 * glow) + 40, math.floor(80 * glow) + 40)
-			end
-		end
-	end)
 end
 
 return WorldBuilder
