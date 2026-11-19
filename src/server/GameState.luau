@@ -1,138 +1,237 @@
 -- GameState.luau
--- Central in-memory state for Brainrot Bazaar. Nothing is persisted: when a
--- player leaves, their cash, brainrots and plot claim are released. All other
--- server modules read and mutate state through the tables exposed here.
+-- All mutable game state lives here, in memory only (no DataStore): player
+-- wallets, base ownership, pad occupants, locks, rebirths and collections.
+-- Every other server module reads and writes state through this module so
+-- there is exactly one place where the rules of money are enforced.
 
 local GameState = {}
 
--- Tuning constants for the whole game loop.
-GameState.Constants = {
-	StartCash = 100,
-	SpawnInterval = 3.5, -- seconds between shop spawns
-	BeltLength = 140, -- conveyor length along X
-	BeltSpeed = 7, -- studs per second a rider travels
-	BeltTopY = 1.3, -- height of the belt surface
-	WalkSpeed = 10, -- studs per second for bought brainrots walking home
-	LockDuration = 60, -- seconds a base stays locked
-	TsunamiPeriod = 180, -- seconds between waves
-	TsunamiWarning = 10, -- seconds of warning before the wave hits
-	ThiefMinDelay = 70, -- thief visits somewhere in this window
-	ThiefMaxDelay = 120,
-	ThiefSpeed = 12,
-	PadsPerPlot = 6,
-	RebirthBaseCost = 10000, -- cost = base * 3 ^ rebirths
-	RebirthCostGrowth = 3,
-	RebirthBonusPer = 0.75, -- multiplier = 1 + bonus * rebirths
-}
+GameState.START_CASH = 100
+GameState.PADS_PER_BASE = 6
+GameState.BASE_COUNT = 8
+GameState.LOCK_SECONDS = 60
+GameState.REBIRTH_BASE_COST = 10000
+GameState.REBIRTH_COST_GROWTH = 3
+GameState.REBIRTH_BONUS = 0.75
 
--- Per-player record, created on join:
---   Cash (spendable), Rebirths, Plot (plot record or nil),
---   Brainrots: array of { Model, Def, Mutation, Income, PadIndex }
-GameState.Players = {}
+-- World layout constants shared by the builder and the game logic.
+-- The plaza sits at the origin; the belt runs along +X in front of the shop;
+-- eight bases ring the plaza in two rows of four.
+GameState.PLAZA_CENTER = Vector3.new(0, 0, 0)
+GameState.BELT_Y = 3
+GameState.BELT_START = Vector3.new(-70, GameState.BELT_Y, 42)
+GameState.BELT_END = Vector3.new(70, GameState.BELT_Y, 42)
+GameState.BASE_SIZE = Vector3.new(34, 1, 30)
 
--- Plot records are created by WorldBuilder and registered here. A plot is:
---   { Index, Folder, Floor, Pads = {BasePart...}, CollectPad, LockButton,
---     Sign, Barriers = {Part...}, Owner = playerState or nil,
---     Stored = cash waiting on the collect pad, LockedUntil = os.clock() end }
-GameState.Plots = {}
-
--- Live transient brainrots: belt riders and walkers heading to a base.
--- Each entry: { Model, Kind = "belt" | "walker", Def, Mutation, Price, Income }
-GameState.Transients = {}
-
--- Seconds until the next tsunami; the server bootstrap owns the countdown
--- and mirrors it here so the HUD payload and the wave logic agree.
-GameState.TsunamiCountdown = GameState.Constants.TsunamiPeriod
-GameState.TsunamiActive = false
-
-function GameState.NewPlayerState(player)
-	local state = {
-		Player = player,
-		Cash = GameState.Constants.StartCash,
-		Rebirths = 0,
-		Plot = nil,
-		Brainrots = {},
-	}
-	GameState.Players[player] = state
-	return state
+local baseOrigins = {}
+for i = 1, GameState.BASE_COUNT do
+	local col = (i - 1) % 4
+	local row = math.floor((i - 1) / 4)
+	local x = -66 + col * 44
+	local z = row == 0 and -52 or 96
+	baseOrigins[i] = Vector3.new(x, 0, z)
 end
 
-function GameState.GetPlayerState(player)
-	return GameState.Players[player]
+function GameState.GetBaseOrigin(baseIndex)
+	return baseOrigins[baseIndex]
 end
 
-function GameState.RemovePlayerState(player)
-	GameState.Players[player] = nil
+-- Pad spots inside a base, in local offsets from the base origin: two
+-- columns of three, leaving the middle lane free to walk.
+function GameState.GetPadPosition(baseIndex, padIndex)
+	local origin = baseOrigins[baseIndex]
+	local col = (padIndex - 1) % 2
+	local row = math.floor((padIndex - 1) / 2)
+	local dx = col == 0 and -9 or 9
+	local dz = -9 + row * 9
+	return origin + Vector3.new(dx, 1, dz)
 end
 
--- Income multiplier from rebirths: 1 + 0.75 per rebirth.
-function GameState.MultiplierFor(rebirths)
-	return 1 + GameState.Constants.RebirthBonusPer * rebirths
+function GameState.GetCollectPadPosition(baseIndex)
+	return baseOrigins[baseIndex] + Vector3.new(0, 1, 11)
 end
 
--- Cash needed for the next rebirth: 10000 * 3 ^ current rebirths.
-function GameState.RebirthCostFor(rebirths)
-	return GameState.Constants.RebirthBaseCost * (GameState.Constants.RebirthCostGrowth ^ rebirths)
+function GameState.GetLockButtonPosition(baseIndex)
+	return baseOrigins[baseIndex] + Vector3.new(13, 1, 11)
 end
 
--- Total income per second a player's placed brainrots produce, before the
--- rebirth multiplier is applied.
-function GameState.RawIncomePerSecond(state)
-	local total = 0
-	for _, entry in ipairs(state.Brainrots) do
-		total += entry.Income
+-- Is a world position inside this base's floor rectangle (with a margin)?
+function GameState.IsInsideBase(position, baseIndex)
+	local origin = baseOrigins[baseIndex]
+	return math.abs(position.X - origin.X) <= GameState.BASE_SIZE.X / 2 + 1
+		and math.abs(position.Z - origin.Z) <= GameState.BASE_SIZE.Z / 2 + 1
+end
+
+function GameState.IsInsideAnyBase(position)
+	for i = 1, GameState.BASE_COUNT do
+		if GameState.IsInsideBase(position, i) then
+			return true
+		end
 	end
-	return total
+	return false
 end
 
-function GameState.IncomePerSecond(state)
-	return GameState.RawIncomePerSecond(state) * GameState.MultiplierFor(state.Rebirths)
+-- Per-player record factory. Pads hold nil or a table:
+-- { Entry = brainrot entry, Mutation = mutation table or nil,
+--   Income = final income per second, Model = the placed Model }
+local function newPlayerRecord(player, baseIndex)
+	local pads = {}
+	for i = 1, GameState.PADS_PER_BASE do
+		pads[i] = nil
+	end
+	return {
+		Player = player,
+		BaseIndex = baseIndex,
+		Cash = GameState.START_CASH,
+		Stored = 0,
+		Rebirths = 0,
+		GachaRolls = 0,
+		LockedUntil = 0,
+		Pads = pads,
+		Collection = {},
+	}
 end
 
--- First unclaimed plot, or nil when the server is full.
-function GameState.ClaimFreePlot(state)
-	for _, plot in ipairs(GameState.Plots) do
-		if plot.Owner == nil then
-			plot.Owner = state
-			plot.Stored = 0
-			plot.LockedUntil = 0
-			state.Plot = plot
-			return plot
+GameState.Players = {}
+GameState.BaseOwners = {}
+
+function GameState.ClaimBase(player)
+	for i = 1, GameState.BASE_COUNT do
+		if GameState.BaseOwners[i] == nil then
+			GameState.BaseOwners[i] = player
+			local record = newPlayerRecord(player, i)
+			GameState.Players[player] = record
+			return record
 		end
 	end
 	return nil
 end
 
--- First pad index (1..PadsPerPlot) not occupied by one of the owner's
--- brainrots, or nil when the base is full.
-function GameState.FirstFreePadIndex(state)
-	local used = {}
-	for _, entry in ipairs(state.Brainrots) do
-		if entry.PadIndex then
-			used[entry.PadIndex] = true
+function GameState.ReleasePlayer(player)
+	local record = GameState.Players[player]
+	if record then
+		GameState.BaseOwners[record.BaseIndex] = nil
+		GameState.Players[player] = nil
+	end
+end
+
+function GameState.Get(player)
+	return GameState.Players[player]
+end
+
+function GameState.Multiplier(record)
+	return 1 + GameState.REBIRTH_BONUS * record.Rebirths
+end
+
+function GameState.RebirthCost(record)
+	return GameState.REBIRTH_BASE_COST * (GameState.REBIRTH_COST_GROWTH ^ record.Rebirths)
+end
+
+-- Income per second summed over the pads, before the rebirth multiplier.
+function GameState.PadIncome(record)
+	local total = 0
+	for _, pad in ipairs(record.Pads) do
+		if pad then
+			total += pad.Income
 		end
 	end
-	for i = 1, GameState.Constants.PadsPerPlot do
-		if not used[i] then
+	return total
+end
+
+function GameState.IncomePerSecond(record)
+	return GameState.PadIncome(record) * GameState.Multiplier(record)
+end
+
+function GameState.FindFreePad(record)
+	for i, pad in ipairs(record.Pads) do
+		if pad == nil then
 			return i
 		end
 	end
 	return nil
 end
 
--- How many brainrots currently sit on pads across every base? Handy for
--- diagnostics and for the thief's target scan.
-function GameState.PlacedBrainrotCount()
-	local total = 0
-	for _, state in pairs(GameState.Players) do
-		total += #state.Brainrots
-	end
-	return total
+function GameState.IsLocked(record)
+	return os.clock() < record.LockedUntil
 end
 
--- Is this plot's lock currently holding?
-function GameState.IsLocked(plot)
-	return plot.LockedUntil ~= nil and os.clock() < plot.LockedUntil
+function GameState.LockBase(record)
+	record.LockedUntil = os.clock() + GameState.LOCK_SECONDS
+end
+
+-- Place a brainrot on a pad and remember the collection entry. The model is
+-- attached by the caller once it has walked home.
+function GameState.PlaceOnPad(record, padIndex, entry, mutation, income)
+	record.Pads[padIndex] = {
+		Entry = entry,
+		Mutation = mutation,
+		Income = income,
+		Model = nil,
+	}
+	record.Collection[entry.Id] = true
+	local player = record.Player
+	if player then
+		player:SetAttribute("Owned_" .. entry.Id, true)
+	end
+end
+
+function GameState.ClearPad(record, padIndex)
+	record.Pads[padIndex] = nil
+end
+
+-- The richest placed brainrot across every unlocked base, for the thief.
+function GameState.FindRichestStolenCandidate()
+	local best = nil
+	for _, record in pairs(GameState.Players) do
+		if not GameState.IsLocked(record) then
+			for padIndex, pad in ipairs(record.Pads) do
+				if pad and (best == nil or pad.Income > best.Pad.Income) then
+					best = { Record = record, PadIndex = padIndex, Pad = pad }
+				end
+			end
+		end
+	end
+	return best
+end
+
+-- Rebirth: wipe cash and pads, keep the collection, gain the multiplier.
+-- Returns true when the player could afford it.
+function GameState.TryRebirth(record)
+	local cost = GameState.RebirthCost(record)
+	if record.Cash + record.Stored < cost then
+		return false
+	end
+	record.Cash = 0
+	record.Stored = 0
+	for i = 1, GameState.PADS_PER_BASE do
+		local pad = record.Pads[i]
+		if pad and pad.Model then
+			pad.Model:Destroy()
+		end
+		record.Pads[i] = nil
+	end
+	record.Rebirths += 1
+	return true
+end
+
+-- How many distinct brainrots this player has ever owned (index progress).
+function GameState.CollectionCount(record)
+	local count = 0
+	for _ in pairs(record.Collection) do
+		count += 1
+	end
+	return count
+end
+
+-- Occupied pad count, for "base full" checks and HUD flavour.
+function GameState.OccupiedPads(record)
+	local count = 0
+	for _, pad in ipairs(record.Pads) do
+		if pad then
+			count += 1
+		end
+	end
+	return count
 end
 
 return GameState
